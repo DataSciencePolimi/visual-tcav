@@ -1,0 +1,28 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+env/
+.env/
+
+# Package build files
+dist/
+build/
+*.egg-info/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Visual-TCAV cache files
+.cache/
+*.joblib
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
