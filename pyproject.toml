@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "visual-tcav"
@@ -9,7 +9,7 @@ description = "Visual-TCAV: Concept-based Attribution and Saliency Maps for Expl
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [
-    { name = "Sara Cavallini", email = "" }
+    { name = "Sara Cavallini", email = "saracavallini01@gmail.com" }
 ]
 keywords = [
     "explainable-ai",
