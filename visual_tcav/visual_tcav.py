@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from joblib import dump, load
+from typing import Callable, Optional
 
 from visual_tcav.utils import (
     Cav,
@@ -45,12 +46,40 @@ class VisualTCAV:
     n_classes : int, optional
         Number of top predicted classes to explain. Default is 3.
     m_steps : int, optional
-        Interpolation steps for Integrated Gradients. Higher = more accurate
-        but slower. Default is 50.
+        Interpolation steps for Integrated Gradients. Default is 50.
     max_examples : int, optional
         Maximum number of concept/random images to use. Default is 500.
     cache_dir : str, optional
         Directory for caching CAVs and activations. Default is ".cache".
+    cav_fn : callable, optional
+        Custom function for computing the CAV from concept and random
+        feature representations. If not provided, the default centroid
+        difference method is used.
+
+        The function must have this signature:
+
+            def cav_fn(
+                concept_features: torch.Tensor,  # [N, C] pooled concept activations
+                random_features: torch.Tensor,   # [N, C] pooled random activations
+            ) -> Cav:
+                ...
+
+        This allows researchers to plug in alternative CAV computation
+        methods (e.g. linear SVM) without modifying the package source code.
+
+    Examples
+    --------
+    Default usage (centroid difference):
+
+    >>> tcav = LocalVisualTCAV(model_wrapper=wrapper, ...)
+
+    Custom CAV function (e.g. linear SVM):
+
+    >>> def svm_cav(concept_features, random_features):
+    ...     # your custom implementation here
+    ...     return Cav(direction=my_direction)
+    >>>
+    >>> tcav = LocalVisualTCAV(model_wrapper=wrapper, cav_fn=svm_cav, ...)
     """
 
     def __init__(
@@ -60,6 +89,7 @@ class VisualTCAV:
         m_steps: int = 50,
         max_examples: int = 500,
         cache_dir: str = ".cache",
+        cav_fn: Optional[Callable] = None,
     ):
         self.model_wrapper = model_wrapper
         self.n_classes = n_classes
@@ -79,6 +109,9 @@ class VisualTCAV:
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
+
+        # Use provided CAV function or fall back to centroid difference default
+        self.cav_fn = cav_fn if cav_fn is not None else self._default_cav_fn
 
         os.makedirs(self.cache_dir, exist_ok=True)
 
@@ -230,6 +263,52 @@ class VisualTCAV:
 
         return pooled
 
+    def _default_cav_fn(
+        self,
+        concept_features: torch.Tensor,
+        random_features: torch.Tensor,
+    ) -> Cav:
+        """
+        Default CAV computation using centroid difference.
+
+        Computes the CAV direction as the difference between the mean
+        concept activation (positive centroid) and the mean random
+        activation (negative centroid), as described in the original
+        Visual-TCAV paper.
+
+        This is the method used when no custom cav_fn is provided.
+
+        Parameters
+        ----------
+        concept_features : torch.Tensor
+            Pooled feature maps of concept images. Shape: [N, C].
+        random_features : torch.Tensor
+            Pooled feature maps of random images. Shape: [N, C].
+
+        Returns
+        -------
+        Cav
+            CAV with direction, centroids, and concept emblem set.
+        """
+        positive_centroid = torch.mean(concept_features, dim=0)
+        negative_centroid = torch.mean(random_features, dim=0)
+
+        # Direction points from "random" toward "concept" in feature space
+        direction = positive_centroid - negative_centroid
+
+        # Concept emblem: scale factor for concept map normalization
+        concept_emblem = contraharmonic_mean(
+            F.relu(concept_features.unsqueeze(-1).unsqueeze(-1)), axis=(2, 3)
+        )
+        concept_emblem = torch.mean(concept_emblem, dim=0)
+
+        return Cav(
+            concept_centroid=positive_centroid,
+            negative_centroid=negative_centroid,
+            direction=direction,
+            concept_emblem=concept_emblem,
+        )
+
     def _compute_cavs(
         self,
         layer_name: str,
@@ -238,11 +317,10 @@ class VisualTCAV:
         use_cache: bool = True,
     ) -> Cav:
         """
-        Compute the CAV for a concept at a specific layer.
+        Compute (or load) the CAV for a concept at a specific layer.
 
-        The CAV direction is the difference between the positive centroid
-        (mean of concept activations) and the negative centroid (mean of
-        random activations), pointing toward the concept in feature space.
+        Handles caching and feature extraction, then delegates the actual
+        CAV computation to self.cav_fn (default or user-provided).
 
         Parameters
         ----------
@@ -258,7 +336,7 @@ class VisualTCAV:
         Returns
         -------
         Cav
-            The computed CAV with direction, centroids, and concept emblem.
+            The computed CAV.
         """
         cache_path = os.path.join(
             self.cache_dir,
@@ -280,25 +358,8 @@ class VisualTCAV:
         pooled_concepts = F.adaptive_avg_pool2d(feature_maps, (1, 1))
         pooled_concepts = pooled_concepts.squeeze(-1).squeeze(-1)
 
-        positive_centroid = torch.mean(pooled_concepts, dim=0)
-        negative_centroid = torch.mean(random_activations, dim=0)
-
-        # Direction points from "random" toward "concept" in feature space
-        direction = positive_centroid - negative_centroid
-
-        # Concept emblem: scale factor derived from concept activations,
-        # used to normalize concept maps so they are comparable across images
-        concept_emblem = contraharmonic_mean(
-            F.relu(feature_maps), axis=(2, 3)
-        )
-        concept_emblem = torch.mean(concept_emblem, dim=0)
-
-        cav = Cav(
-            concept_centroid=positive_centroid,
-            negative_centroid=negative_centroid,
-            direction=direction,
-            concept_emblem=concept_emblem,
-        )
+        # Delegate to cav_fn — default centroid method or user-provided function
+        cav = self.cav_fn(pooled_concepts, random_activations)
 
         if use_cache:
             dump(cav.cpu(), cache_path)
