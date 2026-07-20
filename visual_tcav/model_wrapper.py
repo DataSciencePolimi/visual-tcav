@@ -18,15 +18,12 @@ from prettytable import PrettyTable
 sys.dont_write_bytecode = True
 
 
-# ---------------------------------------------------------------------------
-# Helper: compute a safe batch size
-# ---------------------------------------------------------------------------
-
 def _safe_batch_size(n_samples: int, desired: int = 32) -> int:
     """
     Find the largest batch size <= desired that evenly divides n_samples.
 
-    This avoids issues with uneven batches during gradient computation.
+    Uneven batches cause errors during gradient computation, so we ensure
+    every batch has exactly the same number of samples.
 
     Parameters
     ----------
@@ -46,25 +43,17 @@ def _safe_batch_size(n_samples: int, desired: int = 32) -> int:
     return size
 
 
-# ---------------------------------------------------------------------------
-# Helper models: extract feature maps or logits at a specific layer
-# ---------------------------------------------------------------------------
-
 class _FeatureMapsModel(nn.Module):
     """
-    A helper model that runs the input through a CNN up to a specific layer
-    and returns the feature maps (activations) at that layer.
-
-    Think of it as cutting the CNN at a certain point and reading
-    what comes out there.
+    Runs the input through a CNN up to a specific layer and returns
+    the feature maps (activations) at that point.
 
     Parameters
     ----------
     model : nn.Module
-        The full CNN model (e.g. ResNet50).
+        The full CNN model.
     layer_name : str
-        Name of the layer where we want to extract feature maps.
-        Must be a top-level child of the model (e.g. 'layer4' for ResNet50).
+        Name of the layer to extract feature maps from.
     """
 
     def __init__(self, model: nn.Module, layer_name: str):
@@ -80,7 +69,6 @@ class _FeatureMapsModel(nn.Module):
             )
 
         idx = names.index(layer_name)
-        # Keep only layers up to and including the target layer
         self.layers = nn.Sequential(*modules[: idx + 1])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -89,23 +77,18 @@ class _FeatureMapsModel(nn.Module):
 
 class _LogitsModel(nn.Module):
     """
-    A helper model that takes feature maps from a specific layer as input
-    and runs them through the REST of the CNN to produce final class scores
-    (logits).
+    Takes feature maps from a specific layer and runs the remaining
+    CNN layers to produce final class scores (logits).
 
-    This is the opposite of _FeatureMapsModel: instead of cutting the CNN
-    at a layer and reading what comes out, we START from that layer and
-    run everything after it.
-
-    This is needed for Integrated Gradients: we need to compute gradients
-    of the final class score with respect to the feature maps.
+    Used during Integrated Gradients to compute gradients of the class
+    score with respect to intermediate feature maps.
 
     Parameters
     ----------
     model : nn.Module
-        The full CNN model (e.g. ResNet50).
+        The full CNN model.
     layer_name : str
-        Name of the layer where the feature maps come from.
+        Name of the layer the feature maps come from.
     """
 
     def __init__(self, model: nn.Module, layer_name: str):
@@ -121,67 +104,50 @@ class _LogitsModel(nn.Module):
             )
 
         idx = names.index(layer_name)
-
-        # Everything AFTER the target layer, except the last two
-        # (avgpool and fc in ResNet50)
+        # Everything after the target layer except avgpool and fc,
+        # which are handled separately to support models with different heads
         self.conv_layers = nn.Sequential(*modules[idx + 1: -2])
-
-        # The final average pooling and fully connected layer
         self.avg_layer = modules[-2]
         self.fc_layer = modules[-1]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.conv_layers(x)
         x = self.avg_layer(x)
-        x = x.view(x.size(0), -1)  # flatten
+        x = x.view(x.size(0), -1)  # flatten before the fully connected layer
         x = self.fc_layer(x)
         return x
 
 
-# ---------------------------------------------------------------------------
-# TorchModelWrapper
-# ---------------------------------------------------------------------------
-
 class TorchModelWrapper:
     """
-    Wraps any PyTorch CNN model and provides a consistent interface
-    for Visual-TCAV to use.
+    Wraps any PyTorch CNN and provides a consistent interface for Visual-TCAV.
 
-    Instead of Visual-TCAV knowing the details of every possible model,
-    it just talks to this wrapper. The wrapper handles all the
-    model-specific details internally.
+    Handles model loading, preprocessing, label management, and exposes
+    methods to extract predictions, feature maps, and gradients at any layer.
 
     Parameters
     ----------
     model_name : str
         A name for this model, used for caching and display.
-        Example: "resnet50"
     model : nn.Module, optional
-        A PyTorch model object already loaded in memory.
-        Either model or model_path must be provided.
+        A PyTorch model already loaded in memory.
     model_path : str, optional
         Path to a saved PyTorch model file (.pt or .pth).
-        Either model or model_path must be provided.
     labels : list of str, optional
-        List of class names. Index must match model output.
-        Example: ["tench", "goldfish", ..., "zebra", ...]
+        List of class names indexed by model output position.
     labels_path : str, optional
         Path to a text file with one class name per line.
     model_preprocess : callable, optional
-        Preprocessing function to apply to images before passing
-        them to the model (e.g. normalization).
-        If not provided, will try to read it from model._weights.
+        Preprocessing function applied to images before inference.
+        Auto-loaded from model._weights if not provided.
     input_size : tuple, optional
-        Expected input size as (C, H, W). Example: (3, 224, 224).
-        If not provided, will be inferred automatically.
+        Expected input size as (C, H, W). Inferred automatically if omitted.
     batch_size : int, optional
         Default batch size for processing multiple images. Default: 32.
 
     Examples
     --------
     >>> import torchvision.models as models
-    >>> from visual_tcav.model_wrapper import TorchModelWrapper
-    >>>
     >>> resnet = models.resnet50(weights='DEFAULT')
     >>> wrapper = TorchModelWrapper(model_name="resnet50", model=resnet)
     >>> wrapper.info()
@@ -198,13 +164,10 @@ class TorchModelWrapper:
         input_size: tuple = None,
         batch_size: int = 32,
     ):
-        # Device: use GPU if available, otherwise CPU
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
         self.model_name = model_name
         self.batch_size = batch_size
 
-        # --- Load model ---
         if model is not None:
             self.model = model
         elif model_path is not None:
@@ -213,13 +176,14 @@ class TorchModelWrapper:
             )
         else:
             raise ValueError(
-                "You must provide either 'model' (a PyTorch model object) "
+                "Provide either 'model' (a PyTorch nn.Module) "
                 "or 'model_path' (path to a saved model file)."
             )
-        self.model.to(self.device)
-        self.model.eval()  # set to evaluation mode (disables dropout, batchnorm updates)
 
-        # --- Load preprocessing function ---
+        self.model.to(self.device)
+        # eval() disables dropout and batchnorm updates during inference
+        self.model.eval()
+
         if model_preprocess is not None:
             self.model_preprocess = model_preprocess
         elif (
@@ -227,13 +191,10 @@ class TorchModelWrapper:
             and self.model._weights is not None
             and hasattr(self.model._weights, "transforms")
         ):
-            # torchvision models store their preprocessing in _weights
             self.model_preprocess = self.model._weights.transforms()
         else:
-            # No preprocessing: just pass the tensor as-is
             self.model_preprocess = nn.Identity()
 
-        # --- Infer input size ---
         if input_size is not None:
             self.input_size = input_size
         elif (
@@ -241,15 +202,12 @@ class TorchModelWrapper:
             and self.model._weights is not None
             and hasattr(self.model._weights, "transforms")
         ):
-            # Run a dummy image through preprocessing to get the size
             dummy = torch.randn(3, 512, 512)
             processed = self.model._weights.transforms()(dummy)
-            self.input_size = tuple(processed.shape)  # (C, H, W)
+            self.input_size = tuple(processed.shape)
         else:
-            # Default to standard ImageNet size
             self.input_size = (3, 224, 224)
 
-        # --- Load labels ---
         if labels is not None:
             self.labels = labels
         elif labels_path is not None:
@@ -260,15 +218,13 @@ class TorchModelWrapper:
             and self.model._weights is not None
             and "categories" in self.model._weights.meta
         ):
-            # torchvision models store their class names in _weights.meta
             self.labels = self.model._weights.meta["categories"]
         else:
             raise ValueError(
-                "You must provide either 'labels' (a list of class names) "
+                "Provide either 'labels' (a list of class names) "
                 "or 'labels_path' (path to a text file with class names)."
             )
 
-        # Binary classification flag
         self.binary_classification = len(self.labels) == 2
 
     # -----------------------------------------------------------------------
@@ -313,43 +269,27 @@ class TorchModelWrapper:
         if label not in self.labels:
             raise ValueError(
                 f"Label '{label}' not found. "
-                f"Check the model's class list with wrapper.info()."
+                f"Check available classes with wrapper.info()."
             )
         return self.labels.index(label)
 
     # -----------------------------------------------------------------------
-    # Info
+    # Model info
     # -----------------------------------------------------------------------
 
     def info(self) -> PrettyTable:
         """
-        Print a table showing the model name, number of classes,
-        and all available layer names.
+        Print available layer names for use with Visual-TCAV.
 
-        This is useful for deciding which layers to analyze with Visual-TCAV.
-        Deeper layers (closer to the output) tend to represent higher-level
-        concepts like "stripes" or "wheels".
+        Deeper layers (closer to the output) capture higher-level concepts
+        such as textures and object parts. For ResNet50, 'layer4' is a
+        good starting point.
 
         Returns
         -------
         PrettyTable
-            A formatted table with model info and layer names.
-
-        Examples
-        --------
-        >>> wrapper.info()
-        +----------------------------+
-        |       Model: resnet50      |
-        +------------+---------------+
-        | N. classes |     Layers    |
-        +------------+---------------+
-        |    1000    |    layer1     |
-        |            |    layer2     |
-        |            |    layer3     |
-        |            |    layer4     |
-        +------------+---------------+
+            Formatted table with model name, number of classes, and layers.
         """
-        # Get only convolutional/feature layers (exclude avgpool and fc)
         layer_names = [
             name for name, module in self.model.named_children()
             if not isinstance(module, (nn.Linear, nn.Flatten))
@@ -361,10 +301,7 @@ class TorchModelWrapper:
             field_names=["N. classes", "Layers"],
         )
         for i, name in enumerate(layer_names):
-            table.add_row([
-                len(self.labels) if i == 0 else "",
-                name,
-            ])
+            table.add_row([len(self.labels) if i == 0 else "", name])
         print(table)
         return table
 
@@ -379,8 +316,7 @@ class TorchModelWrapper:
         Parameters
         ----------
         data : torch.Tensor or DataLoader
-            A single image tensor of shape [1, C, H, W], or a DataLoader
-            that yields batches of images.
+            A single image tensor of shape [1, C, H, W], or a DataLoader.
 
         Returns
         -------
@@ -394,8 +330,7 @@ class TorchModelWrapper:
             with torch.no_grad():
                 for batch_input, _ in data:
                     batch_input = batch_input.to(self.device)
-                    batch_output = softmax(self.model(batch_input))
-                    outputs.append(batch_output.detach().cpu())
+                    outputs.append(softmax(self.model(batch_input)).detach().cpu())
             return torch.cat(outputs, dim=0)
         else:
             with torch.no_grad():
@@ -408,11 +343,7 @@ class TorchModelWrapper:
 
     def get_feature_maps(self, imgs: torch.Tensor, layer_name: str) -> torch.Tensor:
         """
-        Extract feature maps (internal activations) at a specific layer.
-
-        Feature maps are what the CNN "sees" at a given layer.
-        For example, at 'layer4' of ResNet50, the feature maps have
-        shape [batch, 2048, 7, 7] — 2048 channels, 7x7 spatial grid.
+        Extract feature maps at a specific layer.
 
         Parameters
         ----------
@@ -428,11 +359,8 @@ class TorchModelWrapper:
         """
         imgs = imgs.to(self.device)
         f_model = _FeatureMapsModel(self.model, layer_name).to(self.device)
-
         with torch.no_grad():
-            feature_maps = f_model(imgs)
-
-        return feature_maps
+            return f_model(imgs)
 
     def get_feature_maps_for_concept(
         self, concept_path: str, layer_name: str
@@ -440,36 +368,23 @@ class TorchModelWrapper:
         """
         Load all images from a concept folder and extract their feature maps.
 
-        This is the first step in computing a CAV: you load all your
-        concept images (e.g. 50 striped texture photos) and get their
-        internal CNN representations.
-
         Parameters
         ----------
         concept_path : str
-            Path to the folder containing concept images.
-            The folder must contain a subfolder with the images
-            (ImageFolder format).
+            Path to the concept folder (ImageFolder format).
         layer_name : str
             Name of the layer to extract from.
 
         Returns
         -------
         torch.Tensor
-            Feature maps of shape [N, channels, H, W] where N is the
-            number of concept images.
+            Feature maps of shape [N, channels, H, W].
         """
-        images = self._get_images_for_concept(concept_path)
-        feature_maps = self.get_feature_maps(
-            next(iter(images))[0], layer_name
-        )
-
         all_feature_maps = []
         for batch_imgs, _ in self._get_images_for_concept(concept_path):
             batch_imgs = batch_imgs.to(self.device)
             fmaps = self.get_feature_maps(batch_imgs, layer_name)
             all_feature_maps.append(fmaps.detach().cpu())
-
         return torch.cat(all_feature_maps, dim=0)
 
     # -----------------------------------------------------------------------
@@ -480,11 +395,7 @@ class TorchModelWrapper:
         self, feature_maps: torch.Tensor, layer_name: str
     ) -> torch.Tensor:
         """
-        Given feature maps from a specific layer, run the rest of the
-        CNN and return the final class scores (logits).
-
-        This is the second half of the CNN, used during Integrated Gradients
-        computation.
+        Run the second half of the CNN from a specific layer to the output.
 
         Parameters
         ----------
@@ -500,7 +411,6 @@ class TorchModelWrapper:
         """
         if feature_maps.dim() == 3:
             feature_maps = feature_maps.unsqueeze(0)
-
         l_model = _LogitsModel(self.model, layer_name).to(self.device)
         return l_model(feature_maps)
 
@@ -515,24 +425,20 @@ class TorchModelWrapper:
         target_class_index: int,
     ) -> torch.Tensor:
         """
-        Compute the gradient of the target class score with respect
-        to the feature maps.
+        Compute the gradient of the target class score w.r.t. feature maps.
 
-        This is the core computation behind Integrated Gradients.
-        The gradient tells us: "if I change this feature map slightly,
-        how much does the class score change?"
-
-        Processed in batches to avoid running out of memory.
+        Core computation for Integrated Gradients: measures how much each
+        feature map value influences the target class prediction.
+        Processed in batches to avoid memory issues.
 
         Parameters
         ----------
         feature_maps : torch.Tensor
-            Feature maps of shape [steps, C, H, W] — the interpolated
-            feature maps generated during Integrated Gradients computation.
+            Interpolated feature maps. Shape: [steps, C, H, W].
         layer_name : str
             Name of the layer the feature maps came from.
         target_class_index : int
-            Index of the class we want to explain (e.g. 340 for zebra).
+            Index of the class to explain.
 
         Returns
         -------
@@ -545,22 +451,15 @@ class TorchModelWrapper:
         for i in range(0, len(feature_maps), batch_size):
             batch = feature_maps[i: i + batch_size].to(self.device)
             inputs = batch.detach().clone().requires_grad_(True)
-
-            # Forward pass: get logits for this batch
             logits = self.get_logits(inputs, layer_name)
-
-            # Select score for target class only
             score = logits[:, target_class_index].sum()
-
-            # Backward pass: compute gradients
             score.backward()
-
             gradients.append(inputs.grad.detach().cpu())
 
         return torch.cat(gradients, dim=0)
 
     # -----------------------------------------------------------------------
-    # Image loading utilities
+    # Image loading
     # -----------------------------------------------------------------------
 
     def _get_image_folder(
@@ -569,12 +468,7 @@ class TorchModelWrapper:
         """
         Load images from a folder using torchvision ImageFolder.
 
-        ImageFolder expects this structure:
-            concept_path/
-            └── any_subfolder_name/
-                ├── image1.jpg
-                ├── image2.jpg
-                └── ...
+        Expects the structure: concept_path/any_subfolder/image_files
 
         Parameters
         ----------
@@ -586,20 +480,26 @@ class TorchModelWrapper:
         Returns
         -------
         datasets.ImageFolder
-            A PyTorch dataset ready to be wrapped in a DataLoader.
+            Dataset ready to be wrapped in a DataLoader.
         """
         C, H, W = self.input_size
 
         if preprocess:
             transform = transforms.Compose([
-                transforms.Resize((H, W), interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.Resize(
+                    (H, W),
+                    interpolation=transforms.InterpolationMode.BILINEAR
+                ),
                 transforms.CenterCrop((H, W)),
                 transforms.ToTensor(),
                 self.model_preprocess,
             ])
         else:
             transform = transforms.Compose([
-                transforms.Resize((H, W), interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.Resize(
+                    (H, W),
+                    interpolation=transforms.InterpolationMode.BILINEAR
+                ),
                 transforms.CenterCrop((H, W)),
                 transforms.ToTensor(),
             ])
@@ -618,8 +518,11 @@ class TorchModelWrapper:
         Returns
         -------
         DataLoader
-            A DataLoader that yields batches of preprocessed images.
+            Yields batches of preprocessed images.
         """
         image_folder = self._get_image_folder(concept_path)
         batch_size = _safe_batch_size(len(image_folder), desired=self.batch_size)
-        return DataLoader(image_folder, batch_size=batch_size, shuffle=False)
+        # num_workers=0 required for Windows compatibility
+        return DataLoader(
+            image_folder, batch_size=batch_size, shuffle=False, num_workers=0
+        )

@@ -1,11 +1,12 @@
 """
 linear_aligner.py
 -----------------
-Linear Aligner: maps representations from one embedding space to another.
+Linear Aligner: maps representations from one embedding space to another
+via a learned linear transformation (y = x @ W.T + b).
 
 Used in the Text-to-Concept pipeline to translate CLIP text embeddings
-into the CNN's internal feature space, enabling CAV generation from
-plain text descriptions instead of concept images.
+(512-dim) into CNN feature space (e.g. 2048-dim for ResNet50 layer4),
+enabling CAV generation from plain text descriptions.
 
 Original implementation by Daniele Di Santi (2025), based on:
     Moayeri et al., "Text-To-Concept (and Back) via Cross-Model Alignment",
@@ -25,19 +26,9 @@ sys.dont_write_bytecode = True
 
 class _LinearRegression(nn.Module):
     """
-    A simple single-layer linear regression model.
+    Single-layer linear model: y = W @ x + b.
 
-    Used internally by LinearRegressionSolver to learn the mapping
-    between two representation spaces.
-
-    Parameters
-    ----------
-    input_size : int
-        Dimensionality of the input vectors (e.g. 512 for CLIP ViT-B/16).
-    output_size : int
-        Dimensionality of the output vectors (e.g. 2048 for ResNet50 layer4).
-    bias : bool
-        Whether to include a bias term. Default is True.
+    Used internally by _LinearRegressionSolver.
     """
 
     def __init__(self, input_size: int, output_size: int, bias: bool = True):
@@ -50,13 +41,11 @@ class _LinearRegression(nn.Module):
 
 class _LinearRegressionSolver:
     """
-    Trains a linear regression model to map one representation space
+    Trains a _LinearRegression model to map one representation space
     to another using SGD optimization.
 
-    Used internally by LinearAligner. Not meant to be used directly.
-
-    The solver normalizes both input and output representations to a
-    target variance before training, improving numerical stability.
+    Both spaces are normalized to a target variance before training
+    to improve numerical stability across different embedding scales.
     """
 
     def __init__(self):
@@ -81,7 +70,7 @@ class _LinearRegressionSolver:
         y : np.ndarray
             Target representations. Shape: [N, output_dim].
         bias : bool
-            Whether to use a bias term. Default True.
+            Whether to include a bias term. Default True.
         batch_size : int
             Training batch size. Default 100.
         epochs : int
@@ -89,18 +78,16 @@ class _LinearRegressionSolver:
         """
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        tensor_X = torch.from_numpy(X).float()
-        tensor_y = torch.from_numpy(y).float()
-        dataset = TensorDataset(tensor_X, tensor_y)
+        dataset = TensorDataset(
+            torch.from_numpy(X).float(),
+            torch.from_numpy(y).float(),
+        )
+        # num_workers=0 required for Windows compatibility
         dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=0,   # 0 is safer on Windows
+            dataset, batch_size=batch_size, shuffle=True, num_workers=0
         )
 
-        self.model = _LinearRegression(X.shape[1], y.shape[1], bias=bias)
-        self.model.to(device)
+        self.model = _LinearRegression(X.shape[1], y.shape[1], bias=bias).to(device)
 
         optimizer = optim.SGD(
             self.model.parameters(),
@@ -108,36 +95,24 @@ class _LinearRegressionSolver:
             momentum=0.9,
             weight_decay=5e-4,
         )
+        # Cosine annealing decays the learning rate smoothly to near zero
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=200
         )
 
-        init_mse, init_r2 = self.test(X, y)
-        print(f"  Initial MSE={init_mse:.3f}, R²={init_r2:.3f}")
-
         self.model.train()
         for epoch in range(epochs):
-            epoch_loss = 0.0
-            n_batches = 0
-
             for inputs, targets in dataloader:
-                inputs = inputs.to(device)
-                targets = targets.to(device)
-
+                inputs, targets = inputs.to(device), targets.to(device)
                 optimizer.zero_grad()
-                outputs = self.model(inputs)
-                loss = self.criterion(outputs, targets)
+                loss = self.criterion(self.model(inputs), targets)
                 loss.backward()
                 optimizer.step()
-
-                epoch_loss += loss.item()
-                n_batches += 1
-
             scheduler.step()
 
     def test(self, X: np.ndarray, y: np.ndarray, batch_size: int = 100):
         """
-        Evaluate the model on data and return MSE and R² score.
+        Evaluate the model and return MSE and R² score.
 
         Parameters
         ----------
@@ -154,40 +129,30 @@ class _LinearRegressionSolver:
             MSE loss and R² score.
         """
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        tensor_X = torch.from_numpy(X).float()
-        tensor_y = torch.from_numpy(y).float()
-        dataset = TensorDataset(tensor_X, tensor_y)
+        dataset = TensorDataset(
+            torch.from_numpy(X).float(),
+            torch.from_numpy(y).float(),
+        )
         dataloader = DataLoader(
             dataset, batch_size=batch_size, shuffle=False, num_workers=0
         )
 
         self.model.eval()
-        total_mse = 0.0
-        n_batches = 0
+        total_mse, n_batches = 0.0, 0
 
         with torch.no_grad():
             for inputs, targets in dataloader:
-                inputs = inputs.to(device)
-                targets = targets.to(device)
-                outputs = self.model(inputs)
-                loss = self.criterion(outputs, targets)
-                total_mse += loss.item()
+                inputs, targets = inputs.to(device), targets.to(device)
+                total_mse += self.criterion(self.model(inputs), targets).item()
                 n_batches += 1
 
         total_mse /= n_batches
+        # R² = 1 means perfect fit; 0 means no better than predicting the mean
         r2 = 1 - total_mse / self.get_variance(y)
         return total_mse, r2
 
     def extract_parameters(self):
-        """
-        Extract the learned weight matrix and bias vector.
-
-        Returns
-        -------
-        tuple of (torch.Tensor, torch.Tensor)
-            Weight matrix W and bias vector b.
-        """
+        """Return the learned weight matrix W and bias vector b."""
         W, b = None, None
         for name, param in self.model.named_parameters():
             if name == "linear.weight":
@@ -198,54 +163,28 @@ class _LinearRegressionSolver:
 
     @staticmethod
     def get_variance(y: np.ndarray) -> float:
-        """
-        Compute the variance of an array.
-
-        Variance = E[y²] - E[y]²
-
-        Parameters
-        ----------
-        y : np.ndarray
-            Input array.
-
-        Returns
-        -------
-        float
-            Variance of the array.
-        """
-        ey = np.mean(y)
-        ey2 = np.mean(np.square(y))
-        return float(ey2 - ey ** 2)
+        """Compute variance as E[y²] - E[y]²."""
+        return float(np.mean(np.square(y)) - np.mean(y) ** 2)
 
 
 class LinearAligner:
     """
     Maps representations from one embedding space to another using a
-    trained linear transformation.
+    learned linear transformation: output = input @ W.T + b.
 
-    In the Text-to-Concept pipeline, this maps CLIP text embeddings
-    (512-dimensional) to CNN layer feature vectors (e.g. 2048-dimensional
-    for ResNet50 layer4).
-
-    The mapping is: output = input @ W.T + b
-
-    Where W and b are learned by minimizing the MSE between aligned
-    CNN representations and CLIP representations of the same images.
+    In the Text-to-Concept pipeline, translates CLIP embeddings (512-dim)
+    into CNN layer feature space (e.g. 2048-dim for ResNet50 layer4).
 
     Parameters
     ----------
-    None. Call train() or load_W() to initialize W and b.
+    None. Call train() or load_W() before calling get_aligned_representation().
 
     Examples
     --------
     Training a new aligner:
 
     >>> aligner = LinearAligner()
-    >>> aligner.train(
-    ...     cnn_representations,    # shape [N, 2048]
-    ...     clip_representations,   # shape [N, 512]
-    ...     epochs=5,
-    ... )
+    >>> aligner.train(cnn_reps, clip_reps, epochs=5)
     >>> aligner.save_W("./aligners/resnet50_layer4.pt")
 
     Loading a pre-trained aligner:
@@ -256,8 +195,8 @@ class LinearAligner:
     """
 
     def __init__(self):
-        self.W = None   # weight matrix
-        self.b = None   # bias vector
+        self.W = None
+        self.b = None
 
     def train(
         self,
@@ -269,66 +208,62 @@ class LinearAligner:
         """
         Train the linear aligner to map source → target representations.
 
-        Before training, both representations are normalized to the same
-        target variance. This improves numerical stability and convergence.
+        Both spaces are scaled to target_variance before training to equalize
+        their numerical ranges (from Moayeri et al., 2023). The scaling is
+        reversed after training so W and b operate on the original vectors.
 
         Parameters
         ----------
         source_representations : np.ndarray
-            Representations from the source space (e.g. CNN features).
-            Shape: [N, source_dim].
+            Source space representations (e.g. CNN features). Shape: [N, src_dim].
         target_representations : np.ndarray
-            Representations from the target space (e.g. CLIP features).
-            Shape: [N, target_dim].
+            Target space representations (e.g. CLIP features). Shape: [N, tgt_dim].
         epochs : int
-            Number of training epochs. Default is 5.
+            Training epochs. Default is 5.
         target_variance : float
-            Both spaces are scaled to this variance before training.
-            Default is 4.5 (from the original paper).
+            Both spaces are scaled to this variance. Default is 4.5.
 
         Raises
         ------
         ValueError
-            If source and target have different number of samples.
+            If source and target have different numbers of samples.
         """
         if source_representations.shape[0] != target_representations.shape[0]:
             raise ValueError(
-                f"source and target must have the same number of samples. "
-                f"Got {source_representations.shape[0]} and "
+                f"source and target must have the same number of samples, "
+                f"got {source_representations.shape[0]} and "
                 f"{target_representations.shape[0]}."
             )
 
         print(
             f"Training LinearAligner: "
-            f"({source_representations.shape}) → ({target_representations.shape})"
+            f"{source_representations.shape} -> {target_representations.shape}"
         )
 
         solver = _LinearRegressionSolver()
 
-        # Compute variance scaling factors
         var_source = solver.get_variance(source_representations)
         var_target = solver.get_variance(target_representations)
 
         c_source = (target_variance / var_source) ** 0.5
         c_target = (target_variance / var_target) ** 0.5
 
-        # Scale both representations to target variance
-        scaled_source = c_source * source_representations
-        scaled_target = c_target * target_representations
-
-        # Train the linear regression
         solver.train(
-            scaled_source, scaled_target,
+            c_source * source_representations,
+            c_target * target_representations,
             bias=True,
             epochs=epochs,
             batch_size=100,
         )
 
-        mse, r2 = solver.test(scaled_source, scaled_target)
+        mse, r2 = solver.test(
+            c_source * source_representations,
+            c_target * target_representations,
+        )
         print(f"  Final MSE={mse:.3f}, R²={r2:.3f}")
 
-        # Extract parameters and rescale back
         W, b = solver.extract_parameters()
+        # Rescale back so W and b operate on the original (unscaled) vectors
         self.W = W * c_source / c_target
         self.b = b * c_source / c_target
 
@@ -338,27 +273,24 @@ class LinearAligner:
         """
         Map input features from source space to target space.
 
-        Applies the learned linear transformation: output = features @ W.T + b
-
         Parameters
         ----------
         features : torch.Tensor
-            Input feature vectors. Shape: [N, source_dim].
+            Input vectors. Shape: [N, source_dim].
 
         Returns
         -------
         torch.Tensor
-            Aligned feature vectors. Shape: [N, target_dim].
+            Aligned vectors. Shape: [N, target_dim].
 
         Raises
         ------
         RuntimeError
-            If the aligner has not been trained or loaded yet.
+            If the aligner has not been trained or loaded.
         """
         if self.W is None or self.b is None:
             raise RuntimeError(
-                "LinearAligner has not been trained or loaded. "
-                "Call train() or load_W() first."
+                "LinearAligner not trained. Call train() or load_W() first."
             )
         return features @ self.W.T + self.b
 
@@ -369,7 +301,7 @@ class LinearAligner:
         Parameters
         ----------
         path : str
-            Path to the saved aligner file (.pt).
+            Path to the saved .pt file.
 
         Raises
         ------
@@ -377,9 +309,7 @@ class LinearAligner:
             If the file does not exist.
         """
         if not os.path.exists(path):
-            raise FileNotFoundError(
-                f"Aligner file not found at: {path}"
-            )
+            raise FileNotFoundError(f"Aligner file not found at: {path}")
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         aligner_dict = torch.load(path, weights_only=False, map_location=device)
@@ -387,8 +317,7 @@ class LinearAligner:
         self.W = aligner_dict["W"].float().to(device)
         self.b = aligner_dict["b"].float().to(device)
 
-        print(f"LinearAligner loaded from: {path}")
-        print(f"  W shape: {self.W.shape}, b shape: {self.b.shape}")
+        print(f"LinearAligner loaded: W={self.W.shape}, b={self.b.shape}")
 
     def save_W(self, path: str) -> None:
         """
@@ -397,24 +326,23 @@ class LinearAligner:
         Parameters
         ----------
         path : str
-            Path where the aligner will be saved (.pt).
+            Destination path (.pt).
 
         Raises
         ------
         RuntimeError
-            If the aligner has not been trained yet.
+            If the aligner has not been trained.
         """
         if self.W is None or self.b is None:
             raise RuntimeError(
-                "Cannot save: LinearAligner has not been trained. "
-                "Call train() first."
+                "Cannot save: LinearAligner not trained. Call train() first."
             )
 
-        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
-        torch.save(
-            {"W": self.W.detach().cpu(), "b": self.b.detach().cpu()},
-            path,
+        os.makedirs(
+            os.path.dirname(path) if os.path.dirname(path) else ".",
+            exist_ok=True,
         )
+        torch.save({"W": self.W.detach().cpu(), "b": self.b.detach().cpu()}, path)
         print(f"LinearAligner saved to: {path}")
 
     def __repr__(self) -> str:

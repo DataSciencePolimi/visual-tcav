@@ -2,7 +2,7 @@
 visual_tcav.py
 --------------
 Base class for Visual-TCAV. Contains all shared logic for computing
-CAVs, integrated gradients, and concept maps.
+CAVs, integrated gradients, concept maps, and attribution scores.
 
 Both LocalVisualTCAV and GlobalVisualTCAV inherit from this class.
 """
@@ -32,16 +32,11 @@ class VisualTCAV:
     """
     Base class for Visual-TCAV.
 
-    Implements the core pipeline shared by both the Local and Global
-    explainers:
-    - Managing concepts and layers
-    - Computing Concept Activation Vectors (CAVs)
-    - Computing random activations (negative examples)
-    - Computing Integrated Gradients
-    - Computing concept maps
+    Implements the core pipeline shared by LocalVisualTCAV and GlobalVisualTCAV:
+    managing concepts and layers, computing CAVs, running Integrated Gradients,
+    and producing concept maps and attribution scores.
 
-    This class is not meant to be used directly. Use LocalVisualTCAV
-    or GlobalVisualTCAV instead.
+    Not meant to be used directly. Use LocalVisualTCAV or GlobalVisualTCAV.
 
     Parameters
     ----------
@@ -50,24 +45,12 @@ class VisualTCAV:
     n_classes : int, optional
         Number of top predicted classes to explain. Default is 3.
     m_steps : int, optional
-        Number of interpolation steps for Integrated Gradients.
-        Higher = more accurate but slower. Default is 50.
+        Interpolation steps for Integrated Gradients. Higher = more accurate
+        but slower. Default is 50.
     max_examples : int, optional
-        Maximum number of concept/random images to use when computing
-        CAVs. Default is 500.
+        Maximum number of concept/random images to use. Default is 500.
     cache_dir : str, optional
-        Directory where CAVs and activations are cached to disk.
-        Default is ".cache".
-
-    Examples
-    --------
-    Do not use this class directly. Use LocalVisualTCAV instead:
-
-    >>> from visual_tcav import LocalVisualTCAV, TorchModelWrapper
-    >>> import torchvision.models as models
-    >>> resnet = models.resnet50(weights='DEFAULT')
-    >>> wrapper = TorchModelWrapper(model_name="resnet50", model=resnet)
-    >>> tcav = LocalVisualTCAV(model_wrapper=wrapper)
+        Directory for caching CAVs and activations. Default is ".cache".
     """
 
     def __init__(
@@ -84,28 +67,23 @@ class VisualTCAV:
         self.max_examples = max_examples
         self.cache_dir = cache_dir
 
-        # Will be set by set_concepts() and set_layers()
         self.concept_names = []
         self.concept_dirs = {}
         self.layer_names = []
         self.random_dir = None
-
-        # Target classes determined after predict()
         self.target_classes = []
 
         # Main storage: computations[layer_name][concept_name] = ConceptLayer
         self.computations = {}
 
-        # Device: GPU if available, otherwise CPU
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
 
-        # Create cache directory if it does not exist
         os.makedirs(self.cache_dir, exist_ok=True)
 
     # -----------------------------------------------------------------------
-    # Public setup methods
+    # Setup
     # -----------------------------------------------------------------------
 
     def set_concepts(
@@ -118,78 +96,51 @@ class VisualTCAV:
         """
         Specify which concepts to analyze.
 
-        You can either provide a dictionary mapping concept names to
-        their image folders, or provide a base directory that contains
-        one subfolder per concept.
-
         Parameters
         ----------
         concept_names : list of str
-            Names of the concepts to analyze (e.g. ["striped", "dotted"]).
+            Names of the concepts (e.g. ["striped", "dotted"]).
         concept_dirs : dict, optional
-            Dictionary mapping concept name → path to image folder.
-            Example: {"striped": "./images/striped", "dotted": "./images/dotted"}
+            Explicit mapping of concept name to image folder path.
         concept_base_dir : str, optional
-            Path to a folder that contains one subfolder per concept.
-            Example: if concept_base_dir="./images" and concept_names=["striped"],
-            it will look for images in "./images/striped/".
+            Base folder containing one subfolder per concept.
         random_dir : str, optional
-            Path to the folder containing random (negative) images.
-            If not provided, looks for a "random" folder inside concept_base_dir.
+            Folder containing random (negative) images.
 
         Raises
         ------
         ValueError
-            If neither concept_dirs nor concept_base_dir is provided.
-        ValueError
-            If any concept folder does not exist.
-
-        Examples
-        --------
-        >>> tcav.set_concepts(
-        ...     concept_names=["striped", "dotted"],
-        ...     concept_base_dir="./concept_images",
-        ...     random_dir="./concept_images/random",
-        ... )
+            If neither concept_dirs nor concept_base_dir is provided,
+            or if any concept folder does not exist.
         """
         if concept_dirs is not None:
-            # User provided explicit paths
             self.concept_dirs = concept_dirs
         elif concept_base_dir is not None:
-            # Build paths automatically from base directory
             self.concept_dirs = {
                 name: os.path.join(concept_base_dir, name)
                 for name in concept_names
             }
         else:
             raise ValueError(
-                "You must provide either 'concept_dirs' (a dictionary mapping "
-                "concept names to folders) or 'concept_base_dir' (a folder "
-                "containing one subfolder per concept)."
+                "Provide either 'concept_dirs' or 'concept_base_dir'."
             )
 
-        # Validate that all concept folders exist
         for name, path in self.concept_dirs.items():
             if not os.path.exists(path):
                 raise ValueError(
-                    f"Concept folder for '{name}' not found at: {path}\n"
-                    f"Make sure the folder exists and contains images."
+                    f"Concept folder for '{name}' not found at: {path}"
                 )
 
         self.concept_names = concept_names
 
-        # Set random images directory
         if random_dir is not None:
             self.random_dir = random_dir
         elif concept_base_dir is not None:
             self.random_dir = os.path.join(concept_base_dir, "random")
-        else:
-            self.random_dir = None
 
         if self.random_dir and not os.path.exists(self.random_dir):
             raise ValueError(
-                f"Random images folder not found at: {self.random_dir}\n"
-                f"Random images are needed as negative examples for CAV computation."
+                f"Random images folder not found at: {self.random_dir}"
             )
 
         print(f"Concepts set: {self.concept_names}")
@@ -198,43 +149,29 @@ class VisualTCAV:
         """
         Specify which CNN layers to analyze.
 
-        To see which layers are available, call model_wrapper.info() first.
-        Deeper layers (closer to the output) tend to represent higher-level
-        concepts. For ResNet50, 'layer4' is a good starting point.
+        Call model_wrapper.info() to see available layer names.
+        Deeper layers capture higher-level concepts.
 
         Parameters
         ----------
         layer_names : list of str
-            Names of the layers to analyze.
-            Example: ["layer3", "layer4"]
+            Layer names (e.g. ["layer3", "layer4"]).
 
         Raises
         ------
         ValueError
             If no layer names are provided.
-
-        Examples
-        --------
-        >>> tcav.set_layers(["layer4"])
-        >>> tcav.set_layers(["layer3", "layer4"])
         """
         if not layer_names:
             raise ValueError(
-                "You must provide at least one layer name. "
+                "Provide at least one layer name. "
                 "Call model_wrapper.info() to see available layers."
             )
         self.layer_names = layer_names
-
-        # Initialize the computations dictionary
-        # computations[layer][concept] = ConceptLayer()
         self.computations = {
-            layer: {
-                concept: ConceptLayer()
-                for concept in self.concept_names
-            }
+            layer: {concept: ConceptLayer() for concept in self.concept_names}
             for layer in self.layer_names
         }
-
         print(f"Layers set: {self.layer_names}")
 
     # -----------------------------------------------------------------------
@@ -245,63 +182,51 @@ class VisualTCAV:
         self, layer_name: str, use_cache: bool = True
     ) -> torch.Tensor:
         """
-        Compute (or load from cache) the pooled activations of random images
-        at the specified layer.
+        Compute (or load) pooled activations of random images at a layer.
 
-        Random images serve as the NEGATIVE examples when computing the CAV.
-        They represent "everything that is NOT the concept".
-
-        The activations are pooled with Global Average Pooling (GAP):
-        instead of keeping the full [C, H, W] feature map for each image,
-        we average across H and W to get a single vector of size [C].
-        This gives one vector per image, which is then used to compute
-        the negative centroid.
+        Random images serve as negative examples for CAV computation.
+        Global Average Pooling reduces [N, C, H, W] to [N, C] so that
+        each image is represented as a single vector.
 
         Parameters
         ----------
         layer_name : str
-            Name of the layer to extract activations from.
+            Layer to extract activations from.
         use_cache : bool
-            If True, saves/loads results from disk to avoid recomputing.
-            Default is True.
+            Save/load results from disk. Default is True.
 
         Returns
         -------
         torch.Tensor
-            Pooled activations of shape [N, C] where N is the number of
-            random images and C is the number of channels at that layer.
+            Pooled activations of shape [N, C].
         """
         cache_path = os.path.join(
             self.cache_dir,
             f"random_{self.model_wrapper.model_name}_{layer_name}.joblib"
         )
 
-        # Try loading from cache first
         if use_cache and os.path.exists(cache_path):
-            print(f"  Loading random activations from cache: {cache_path}")
+            print(f"  Loading random activations from cache.")
             return load(cache_path)
 
         if self.random_dir is None:
             raise ValueError(
                 "Random images directory not set. "
-                "Call set_concepts() with random_dir parameter."
+                "Call set_concepts() with the random_dir parameter."
             )
 
-        print(f"  Computing random activations at layer '{layer_name}'...")
+        print(f"  Computing random activations at '{layer_name}'...")
 
-        # Get feature maps for all random images
         feature_maps = self.model_wrapper.get_feature_maps_for_concept(
             self.random_dir, layer_name
         )
 
-        # Global Average Pooling: average over spatial dimensions (H, W)
-        # Shape: [N, C, H, W] → [N, C]
+        # GAP reduces spatial dimensions: [N, C, H, W] -> [N, C]
         pooled = F.adaptive_avg_pool2d(feature_maps, (1, 1))
-        pooled = pooled.squeeze(-1).squeeze(-1)  # remove H and W dimensions
+        pooled = pooled.squeeze(-1).squeeze(-1)
 
         if use_cache:
             dump(pooled, cache_path)
-            print(f"  Random activations saved to cache.")
 
         return pooled
 
@@ -313,80 +238,61 @@ class VisualTCAV:
         use_cache: bool = True,
     ) -> Cav:
         """
-        Compute the Concept Activation Vector (CAV) for a concept at a layer.
+        Compute the CAV for a concept at a specific layer.
 
-        The CAV is computed as:
-        1. Extract feature maps for all concept images at this layer
-        2. Pool each feature map to a vector (Global Average Pooling)
-        3. Compute the positive centroid (mean of concept vectors)
-        4. Compute the negative centroid (mean of random vectors)
-        5. CAV direction = positive centroid - negative centroid
-        6. Compute concept emblem (scale factor) using contraharmonic mean
+        The CAV direction is the difference between the positive centroid
+        (mean of concept activations) and the negative centroid (mean of
+        random activations), pointing toward the concept in feature space.
 
         Parameters
         ----------
         layer_name : str
-            Name of the layer to compute the CAV at.
+            Layer to compute the CAV at.
         concept_name : str
             Name of the concept (e.g. "striped").
         random_activations : torch.Tensor
             Pre-computed pooled activations of random images. Shape: [N, C].
         use_cache : bool
-            If True, saves/loads the CAV from disk. Default is True.
+            Save/load the CAV from disk. Default is True.
 
         Returns
         -------
         Cav
-            The computed CAV object containing direction, centroids,
-            and concept emblem.
+            The computed CAV with direction, centroids, and concept emblem.
         """
         cache_path = os.path.join(
             self.cache_dir,
             f"cav_{self.model_wrapper.model_name}_{layer_name}_{concept_name}.joblib"
         )
 
-        # Try loading from cache first
         if use_cache and os.path.exists(cache_path):
-            print(f"  Loading CAV from cache: {cache_path}")
+            print(f"  Loading CAV from cache: {concept_name} @ {layer_name}")
             cav = load(cache_path)
             return cav.to(self.device)
 
-        print(f"  Computing CAV for '{concept_name}' at layer '{layer_name}'...")
+        print(f"  Computing CAV: '{concept_name}' @ '{layer_name}'...")
 
-        concept_dir = self.concept_dirs[concept_name]
-
-        # Step 1: Extract feature maps for concept images
         feature_maps = self.model_wrapper.get_feature_maps_for_concept(
-            concept_dir, layer_name
+            self.concept_dirs[concept_name], layer_name
         )
-        # feature_maps shape: [N, C, H, W]
 
-        # Step 2: Pool feature maps → one vector per image
-        # Shape: [N, C, H, W] → [N, C]
+        # GAP: [N, C, H, W] -> [N, C]
         pooled_concepts = F.adaptive_avg_pool2d(feature_maps, (1, 1))
         pooled_concepts = pooled_concepts.squeeze(-1).squeeze(-1)
 
-        # Step 3: Compute positive centroid (mean across all concept images)
-        # Shape: [C]
         positive_centroid = torch.mean(pooled_concepts, dim=0)
-
-        # Step 4: Compute negative centroid (mean across all random images)
-        # Shape: [C]
         negative_centroid = torch.mean(random_activations, dim=0)
 
-        # Step 5: CAV direction = positive - negative
-        # This vector points "toward the concept" in the CNN's internal space
+        # Direction points from "random" toward "concept" in feature space
         direction = positive_centroid - negative_centroid
 
-        # Step 6: Compute concept emblem (scale factor for concept map normalization)
-        # Uses contraharmonic mean on the concept feature maps
-        # This gives a reference scale for how strongly this concept activates
+        # Concept emblem: scale factor derived from concept activations,
+        # used to normalize concept maps so they are comparable across images
         concept_emblem = contraharmonic_mean(
             F.relu(feature_maps), axis=(2, 3)
         )
         concept_emblem = torch.mean(concept_emblem, dim=0)
 
-        # Build and return the CAV object
         cav = Cav(
             concept_centroid=positive_centroid,
             negative_centroid=negative_centroid,
@@ -396,7 +302,6 @@ class VisualTCAV:
 
         if use_cache:
             dump(cav.cpu(), cache_path)
-            print(f"  CAV saved to cache.")
 
         return cav.to(self.device)
 
@@ -410,44 +315,27 @@ class VisualTCAV:
         baseline: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Create M interpolated versions of the feature maps between a baseline
-        and the actual feature maps.
+        Create m_steps interpolations between baseline and actual feature maps.
 
-        This is the first step of Integrated Gradients. Instead of computing
-        the gradient at one point, IG computes it at many points along a
-        straight line from the baseline (zeros) to the actual feature maps,
-        then averages them.
-
-        Think of it like this: instead of asking "how steep is the hill here?",
-        you walk from the bottom to the top and average the steepness at each
-        step.
+        Integrated Gradients averages gradients along a straight path from
+        a zero baseline to the actual feature maps, rather than computing
+        gradients at a single point.
 
         Parameters
         ----------
         feature_maps : torch.Tensor
-            Actual feature maps from the test image. Shape: [1, C, H, W].
+            Actual feature maps. Shape: [1, C, H, W].
         baseline : torch.Tensor
-            Baseline feature maps (usually zeros). Shape: [1, C, H, W].
+            Baseline (typically zeros). Shape: [1, C, H, W].
 
         Returns
         -------
         torch.Tensor
             Interpolated feature maps. Shape: [m_steps, C, H, W].
-            Each slice along dim=0 is one step between baseline and actual.
         """
-        # Create m_steps evenly spaced values between 0 and 1
-        # Shape: [m_steps, 1, 1, 1] for broadcasting
-        alphas = torch.linspace(0, 1, self.m_steps).view(
-            self.m_steps, 1, 1, 1
-        )
-
-        # Interpolate: baseline + alpha * (feature_maps - baseline)
-        # When alpha=0: result = baseline
-        # When alpha=1: result = feature_maps
+        alphas = torch.linspace(0, 1, self.m_steps).view(self.m_steps, 1, 1, 1)
         delta = feature_maps - baseline
-        interpolated = baseline + alphas * delta
-
-        return interpolated
+        return baseline + alphas * delta
 
     def _compute_integrated_gradients(
         self,
@@ -456,60 +344,40 @@ class VisualTCAV:
         class_index: int,
     ) -> torch.Tensor:
         """
-        Compute Integrated Gradients (IG) of a class score with respect
-        to the feature maps.
+        Compute Integrated Gradients of a class score w.r.t. feature maps.
 
-        IG tells us how much each individual value in the feature maps
-        contributed to the final class prediction. Values with high IG
-        are the ones that "mattered most" for the prediction.
-
-        The formula is:
-        IG = (feature_maps - baseline) * mean(gradients along interpolation)
+        Measures how much each feature map value contributed to the final
+        class prediction by averaging gradients across m_steps interpolations
+        between a zero baseline and the actual feature maps.
 
         Parameters
         ----------
         feature_maps : torch.Tensor
-            Feature maps of the test image at a specific layer.
-            Shape: [1, C, H, W].
+            Feature maps of the test image. Shape: [1, C, H, W].
         layer_name : str
-            Name of the layer the feature maps come from.
+            Layer the feature maps come from.
         class_index : int
-            Index of the class to explain (e.g. 340 for zebra).
+            Index of the class to explain.
 
         Returns
         -------
         torch.Tensor
             Integrated gradients. Shape: [C, H, W].
-            Same shape as the input feature maps (without batch dimension).
         """
-        # Baseline: all zeros (represents "no information")
         baseline = torch.zeros_like(feature_maps)
-
-        # Step 1: Create interpolated feature maps between baseline and actual
-        # Shape: [m_steps, C, H, W]
         interpolated = self._interpolate_feature_maps(feature_maps, baseline)
 
-        # Step 2: Compute gradients at each interpolation step
-        # Shape: [m_steps, C, H, W]
         gradients = self.model_wrapper.get_gradient_of_score(
             interpolated, layer_name, class_index
         )
 
-        # Step 3: Average the gradients across all interpolation steps
-        # Shape: [C, H, W]
         avg_gradients = torch.mean(gradients, dim=0)
 
-        # Step 4: Multiply by (feature_maps - baseline)
-        # This scales the gradients by how much each value actually changed
-        # Shape: [C, H, W]
-        integrated_gradients = (
-            feature_maps.squeeze(0) - baseline.squeeze(0)
-        ) * avg_gradients
-
-        return integrated_gradients
+        # Scale by the actual input change from baseline to feature maps
+        return (feature_maps.squeeze(0) - baseline.squeeze(0)) * avg_gradients
 
     # -----------------------------------------------------------------------
-    # Concept map computation
+    # Concept map
     # -----------------------------------------------------------------------
 
     def _compute_concept_map(
@@ -520,15 +388,9 @@ class VisualTCAV:
         """
         Compute the raw concept map for a test image.
 
-        The concept map is a spatial heatmap showing WHERE in the image
-        the CNN has detected the presence of a concept.
-
-        It is computed as a weighted sum of the feature maps, where the
-        weights come from the CAV direction (similar to GradCAM):
-
-        concept_map = ReLU( sum_k( cav_direction[k] * feature_maps[k] ) )
-
-        Where k iterates over the C channels of the feature maps.
+        Analogous to GradCAM: computes a weighted sum of feature maps
+        using CAV direction components as weights, then applies ReLU
+        to keep only locations where the concept is present.
 
         Parameters
         ----------
@@ -540,23 +402,14 @@ class VisualTCAV:
         Returns
         -------
         torch.Tensor
-            Raw concept map. Shape: [H, W].
-            Values are non-negative (ReLU applied).
+            Raw concept map. Shape: [H, W]. Non-negative values only.
         """
-        # CAV direction shape: [C]
-        # We need it as [C, 1, 1] to multiply with feature maps [1, C, H, W]
-        direction = cav.direction.to(self.device)
-        direction = direction.view(-1, 1, 1)
-
-        # Weighted sum across channels: [1, C, H, W] → [1, H, W]
+        # Reshape direction [C] -> [C, 1, 1] for broadcasting with [C, H, W]
+        direction = cav.direction.to(self.device).view(-1, 1, 1)
         weighted = feature_maps.squeeze(0) * direction
         raw_map = weighted.sum(dim=0)
-
-        # ReLU: keep only positive activations
-        # (negative means the concept is ABSENT, we only care where it IS)
-        raw_map = F.relu(raw_map)
-
-        return raw_map
+        # Negative values indicate the concept is absent — discard them
+        return F.relu(raw_map)
 
     def _normalize_concept_map(
         self,
@@ -564,16 +417,10 @@ class VisualTCAV:
         cav: Cav,
     ) -> torch.Tensor:
         """
-        Normalize a raw concept map using the concept emblem (scale factor).
+        Normalize a raw concept map to [0, 1] using the concept emblem.
 
-        Without normalization, concept maps from different concepts or
-        different images cannot be compared because they have different
-        absolute scales.
-
-        The normalization formula is:
-        normalized_map[i,j] = min(1, raw_map[i,j] / (concept_emblem + epsilon))
-
-        This clips values to [0, 1], making them interpretable and comparable.
+        Without normalization, concept maps from different concepts or images
+        are not comparable due to differing absolute activation scales.
 
         Parameters
         ----------
@@ -585,21 +432,14 @@ class VisualTCAV:
         Returns
         -------
         torch.Tensor
-            Normalized concept map with values in [0, 1]. Shape: [H, W].
+            Normalized concept map with values in [0, 1].
         """
         concept_emblem = cav.concept_emblem.to(self.device)
-
-        # The concept emblem has shape [C] — take its mean as the scale factor
         scale = torch.mean(concept_emblem) + 1e-10
-
-        # Normalize and clip to [0, 1]
-        normalized = raw_map / scale
-        normalized = torch.clamp(normalized, 0.0, 1.0)
-
-        return normalized
+        return torch.clamp(raw_map / scale, 0.0, 1.0)
 
     # -----------------------------------------------------------------------
-    # Attribution score computation
+    # Attribution score
     # -----------------------------------------------------------------------
 
     def _compute_attribution(
@@ -613,17 +453,10 @@ class VisualTCAV:
         """
         Compute the attribution score for a concept at a layer for a class.
 
-        The attribution score is a single number that measures HOW MUCH
-        the concept contributed to the classification of the test image
-        as a specific class.
-
-        It is computed in three steps:
-        1. Compute Integrated Gradients on the feature maps
-           (how much does each feature map value matter for this class?)
-        2. Multiply IG by the concept map
-           (mask: keep only the parts where the concept IS present)
-        3. Compute the dot product with the normalized CAV direction
-           (project onto the concept direction to get a scalar score)
+        Combines Integrated Gradients with the concept map: IG identifies
+        which feature map values matter for the class prediction, the
+        concept map masks to regions where the concept is present, and
+        the dot product with the CAV direction yields a scalar score.
 
         Parameters
         ----------
@@ -636,37 +469,24 @@ class VisualTCAV:
         layer_name : str
             Name of the layer.
         class_index : int
-            Index of the class to compute the attribution for.
+            Index of the class to compute attribution for.
 
         Returns
         -------
         torch.Tensor
-            A single scalar tensor representing the attribution score.
-            Higher values mean the concept contributed more to the prediction.
+            Scalar attribution score.
         """
-        # Step 1: Compute Integrated Gradients
-        # Shape: [C, H, W]
         ig = self._compute_integrated_gradients(
             feature_maps, layer_name, class_index
         )
 
-        # Step 2: Multiply IG by concept map (element-wise)
-        # concept_map shape: [H, W] → broadcast to [C, H, W]
-        masked_ig = ig * concept_map.unsqueeze(0)
+        # Mask IG with concept map: keep only regions where concept is present
+        masked_ig = F.relu(ig * concept_map.unsqueeze(0))
 
-        # Apply ReLU: keep only positive contributions
-        masked_ig = F.relu(masked_ig)
-
-        # Step 3: Dot product with normalized CAV direction
-        # direction shape: [C] → [C, 1, 1]
         direction = cav.direction.to(self.device)
-        direction_norm = direction / (torch.norm(direction) + 1e-10)
-        direction_norm = direction_norm.view(-1, 1, 1)
+        direction_norm = (direction / (torch.norm(direction) + 1e-10)).view(-1, 1, 1)
 
-        # Element-wise multiply then sum → scalar
-        attribution = (masked_ig * direction_norm).sum()
-
-        return attribution
+        return (masked_ig * direction_norm).sum()
 
     # -----------------------------------------------------------------------
     # Prediction
@@ -681,21 +501,16 @@ class VisualTCAV:
         image_tensor : torch.Tensor
             Preprocessed image tensor. Shape: [1, C, H, W].
         image_path : str
-            Path to the image file (used for display).
+            Path to the image file (used for display purposes).
 
         Returns
         -------
         Predictions
-            Object containing top-k class predictions with names and
-            confidence scores. Call .info() to print a formatted table.
+            Top-k class predictions. Call .info() to print a table.
         """
-        # Get softmax probabilities for all classes
         probs = self.model_wrapper.get_predictions(image_tensor)
-        # probs shape: [1, num_classes]
-
         probs_np = probs[0].numpy()
 
-        # Build list of top n_classes predictions
         predictions = []
         for rank in range(1, self.n_classes + 1):
             idx = nth_highest_index(probs_np, rank)
@@ -713,7 +528,5 @@ class VisualTCAV:
             model_name=self.model_wrapper.model_name,
         )
 
-        # Store target classes for use in explain()
         self.target_classes = [p.class_index for p in predictions]
-
         return result

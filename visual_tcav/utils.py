@@ -16,16 +16,15 @@ sys.dont_write_bytecode = True
 
 
 # ---------------------------------------------------------------------------
-# Small math utilities
+# Math utilities
 # ---------------------------------------------------------------------------
 
 def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
     """
     Compute the cosine similarity between two vectors.
 
-    Cosine similarity measures how similar two vectors are, regardless
-    of their length. Returns 1.0 if identical direction, 0.0 if
-    perpendicular, -1.0 if opposite.
+    Returns 1.0 if identical direction, 0.0 if perpendicular,
+    -1.0 if opposite.
 
     Parameters
     ----------
@@ -70,12 +69,9 @@ def contraharmonic_mean(arr: torch.Tensor, axis: tuple = (0, 1)) -> torch.Tensor
     """
     Compute the contraharmonic mean of a tensor along given axes.
 
-    The contraharmonic mean is defined as sum(x^2) / sum(x).
-    It is used in Visual-TCAV to compute the concept emblem (scale factor)
-    from the concept activations.
-
-    A small epsilon (1e-10) is added to the denominator to avoid
-    division by zero.
+    Defined as sum(x^2) / sum(x). Used to compute the concept emblem
+    (scale factor for concept map normalization) from concept activations.
+    Epsilon avoids division by zero.
 
     Parameters
     ----------
@@ -89,8 +85,7 @@ def contraharmonic_mean(arr: torch.Tensor, axis: tuple = (0, 1)) -> torch.Tensor
     torch.Tensor
         Contraharmonic mean values.
     """
-    x = torch.square(arr)
-    numerator = torch.sum(x, dim=axis)
+    numerator = torch.sum(torch.square(arr), dim=axis)
     denominator = torch.sum(arr, dim=axis)
     return torch.divide(numerator, denominator + 1e-10)
 
@@ -104,21 +99,20 @@ class Cav:
     Stores all data related to a Concept Activation Vector (CAV).
 
     A CAV represents a concept (e.g. 'stripes') as a direction in the
-    internal space of a CNN layer. It is computed as the difference
-    between the mean activation of concept images and the mean activation
-    of random (negative) images at a given layer.
+    internal space of a CNN layer, computed as the difference between
+    the mean activation of concept images and random images.
 
     Attributes
     ----------
     concept_centroid : torch.Tensor or None
-        Mean activation vector of concept images (positive centroid).
+        Mean activation vector of concept images.
     negative_centroid : torch.Tensor or None
-        Mean activation vector of random images (negative centroid).
+        Mean activation vector of random (negative) images.
     direction : torch.Tensor or None
         CAV direction = concept_centroid - negative_centroid.
     concept_emblem : torch.Tensor or None
-        Scale factor used to normalize the concept map.
-        Computed from concept image activations using contraharmonic mean.
+        Scale factor used to normalize concept maps, derived from
+        concept activations via contraharmonic mean.
     """
 
     def __init__(
@@ -146,7 +140,7 @@ class Cav:
         return self
 
     def to(self, device: torch.device) -> "Cav":
-        """Move all tensors to the specified device (CPU or GPU)."""
+        """Move all tensors to the specified device."""
         if self.concept_centroid is not None:
             self.concept_centroid = self.concept_centroid.detach().to(device)
         if self.negative_centroid is not None:
@@ -172,23 +166,17 @@ class ConceptLayer:
     """
     Stores all computed data for a single (concept, layer) pair.
 
-    When Visual-TCAV analyzes concept 'stripes' at layer 'layer4',
-    all results are stored in one ConceptLayer object.
-
     Attributes
     ----------
     cav : Cav
-        The Concept Activation Vector for this (concept, layer) pair.
+        The Concept Activation Vector for this pair.
     concept_map : torch.Tensor or None
-        The spatial heatmap showing where the concept appears in the
-        test image. Shape: [H, W].
+        Spatial heatmap showing where the concept appears. Shape: [H, W].
     attributions : dict
-        Attribution scores for each target class.
-        Keys are class indices (int), values are scalar tensors.
-        Example: {0: tensor(0.22), 1: tensor(0.05)}
+        Attribution scores per class. Keys: class indices, values: scalars.
     """
 
-    def __init__(self, cav: Cav = None):
+    def __init__(self, cav: "Cav" = None):
         self.cav = cav if cav is not None else Cav()
         self.concept_map = None
         self.attributions = {}
@@ -213,7 +201,7 @@ class Prediction:
     class_name : str
         Human-readable class name (e.g. 'zebra').
     class_index : int
-        Class index in the model's output (e.g. 340).
+        Class index in the model output (e.g. 340).
     confidence : float
         Softmax probability for this class (between 0 and 1).
     """
@@ -241,16 +229,16 @@ class Prediction:
 
 class Predictions:
     """
-    Stores all predictions for a test image and provides display utilities.
+    Stores all predictions for a test image.
 
     Attributes
     ----------
     predictions : list of list of Prediction
-        Outer list = images (usually just 1), inner list = top-k classes.
+        Outer list = images, inner list = top-k classes.
     test_image_path : str
         Full path to the test image file.
     test_image_filename : str
-        Just the filename (e.g. 'zebra.jpg').
+        Filename only (e.g. 'zebra.jpg').
     model_name : str
         Name of the model used for prediction.
     """
@@ -278,7 +266,7 @@ class Predictions:
         Returns
         -------
         PrettyTable
-            A formatted table with image name, class name, and confidence.
+            Formatted table with image name, class name, and confidence.
         """
         table = PrettyTable(
             title=f"Model: {self.model_name}",
@@ -312,27 +300,26 @@ class Stat:
     """
     Stores attribution statistics for the Global Explainer.
 
-    The Global Explainer computes attribution scores across many images
-    (e.g. 50 photos of zebras) and summarizes them with mean, standard
-    deviation, and a 95% confidence interval.
+    Computes mean, standard deviation, and a 95.45% confidence interval
+    (mean ± 2 * standard error) across a list of attribution scores.
+    The lower bound is clipped to 0 since attributions are non-negative.
 
     Attributes
     ----------
     attributions : list
-        List of attribution scores (one per test image).
+        Raw attribution scores (one per test image).
     mean : torch.Tensor
-        Mean attribution score across all images.
+        Mean attribution score.
     std : torch.Tensor
-        Standard deviation of attribution scores.
+        Standard deviation (ddof=1 for unbiased estimate).
     n : int
         Number of images.
     std_err : torch.Tensor
         Standard error = std / sqrt(n).
     begin : torch.Tensor
-        Lower bound of the 95.45% confidence interval (mean - 2*std_err).
-        Clipped to 0 with ReLU (attributions cannot be negative).
+        Lower bound of the confidence interval, clipped to 0.
     end : torch.Tensor
-        Upper bound of the 95.45% confidence interval (mean + 2*std_err).
+        Upper bound of the confidence interval.
     """
 
     def __init__(self, attributions: list):
@@ -341,6 +328,7 @@ class Stat:
         self.std = torch.tensor(np.std(attributions, ddof=1), dtype=torch.float32)
         self.n = len(attributions)
         self.std_err = self.std / torch.sqrt(torch.tensor(self.n, dtype=torch.float32))
+        # ReLU clips the lower bound to 0 — attributions cannot be negative
         self.begin = torch.relu(self.mean - self.std_err * 2)
         self.end = self.mean + self.std_err * 2
 
@@ -351,13 +339,13 @@ class Stat:
 
 class CustomColormap:
     """
-    A custom colormap for visualizing concept maps as heatmaps.
+    Custom colormap for visualizing concept maps as heatmaps.
 
-    The default colormap makes low-activation areas black (transparent)
-    and high-activation areas use the jet colormap (blue → red).
-    This makes it easy to overlay the heatmap on top of the original image.
+    Low-activation areas are rendered black (transparent overlay),
+    high-activation areas use the jet colormap (blue to red), making
+    it easy to overlay heatmaps on the original image.
 
-    Attributes
+    Parameters
     ----------
     nodes : list of float
         Positions along the colormap (between 0 and 1).
@@ -368,7 +356,7 @@ class CustomColormap:
     max : float
         Maximum value for colormap scaling.
     alpha : float
-        Transparency of the heatmap overlay (0=transparent, 1=opaque).
+        Transparency of the overlay (0=transparent, 1=opaque).
     """
 
     def __init__(
@@ -387,9 +375,8 @@ class CustomColormap:
                 f"got {len(nodes)} and {len(colors)}."
             )
         if min >= max:
-            raise ValueError(
-                f"min ({min}) must be strictly less than max ({max})."
-            )
+            raise ValueError(f"min ({min}) must be strictly less than max ({max}).")
+
         self.nodes = nodes
         self.colors = colors
         self.min = min
@@ -434,7 +421,7 @@ class CustomColormap:
 
 
 # ---------------------------------------------------------------------------
-# Default colormap used across the package
+# Default colormap instance used across the package
 # ---------------------------------------------------------------------------
 
 _original_colormap = cm.jet
