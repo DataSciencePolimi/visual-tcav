@@ -9,11 +9,9 @@ Both LocalVisualTCAV and GlobalVisualTCAV inherit from this class.
 
 import os
 import sys
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tqdm import tqdm
 from joblib import dump, load
 from typing import Callable, Optional
 
@@ -29,20 +27,97 @@ from visual_tcav.utils import (
 sys.dont_write_bytecode = True
 
 
+def _load_model_wrapper(model, model_name, model_wrapper):
+    """
+    Resolve the model wrapper from the three supported input styles.
+
+    Supports:
+    - Style 1: model="resnet50" (string, auto-loads from torchvision)
+    - Style 2: model=my_resnet (nn.Module, wrapped automatically)
+    - Style 3: model_wrapper=my_wrapper (TorchModelWrapper, used directly)
+
+    Parameters
+    ----------
+    model : str or nn.Module or None
+        Model name string or PyTorch model object.
+    model_name : str or None
+        Optional display name for the model.
+    model_wrapper : TorchModelWrapper or None
+        Pre-built wrapper object.
+
+    Returns
+    -------
+    TorchModelWrapper
+        Ready-to-use model wrapper.
+    """
+    from visual_tcav.model_wrapper import TorchModelWrapper
+
+    if model_wrapper is not None:
+        return model_wrapper
+
+    if isinstance(model, str):
+        import torchvision.models as tv_models
+        supported = {
+            "resnet18":  tv_models.resnet18,
+            "resnet50":  tv_models.resnet50,
+            "resnet101": tv_models.resnet101,
+            "vgg16":     tv_models.vgg16,
+            "vgg19":     tv_models.vgg19,
+        }
+        if model not in supported:
+            raise ValueError(
+                f"Model string '{model}' not supported. "
+                f"Supported names: {list(supported.keys())}. "
+                f"For other models pass an nn.Module directly."
+            )
+        loaded = supported[model](weights="DEFAULT")
+        return TorchModelWrapper(
+            model_name=model_name or model,
+            model=loaded,
+        )
+
+    if isinstance(model, nn.Module):
+        return TorchModelWrapper(
+            model_name=model_name or "model",
+            model=model,
+        )
+
+    raise ValueError(
+        "Provide one of:\n"
+        "  model='resnet50'          (string — auto-loaded)\n"
+        "  model=my_pytorch_model    (nn.Module — wrapped automatically)\n"
+        "  model_wrapper=my_wrapper  (TorchModelWrapper — used directly)"
+    )
+
+
 class VisualTCAV:
     """
     Base class for Visual-TCAV.
 
-    Implements the core pipeline shared by LocalVisualTCAV and GlobalVisualTCAV:
-    managing concepts and layers, computing CAVs, running Integrated Gradients,
-    and producing concept maps and attribution scores.
-
+    Implements the core pipeline shared by LocalVisualTCAV and GlobalVisualTCAV.
     Not meant to be used directly. Use LocalVisualTCAV or GlobalVisualTCAV.
+
+    The model can be provided in three ways (in order of simplicity):
+
+    1. As a string — auto-loaded from torchvision:
+       ``LocalVisualTCAV(model="resnet50", ...)``
+
+    2. As a PyTorch nn.Module — wrapped automatically:
+       ``LocalVisualTCAV(model=my_resnet, ...)``
+
+    3. As an explicit TorchModelWrapper — for full control:
+       ``LocalVisualTCAV(model_wrapper=my_wrapper, ...)``
 
     Parameters
     ----------
-    model_wrapper : TorchModelWrapper
-        The wrapped PyTorch model to explain.
+    model : str or nn.Module, optional
+        Model name (e.g. "resnet50") or PyTorch model object.
+    model_name : str, optional
+        Display name used for caching and logging. Inferred from model
+        if not provided.
+    model_wrapper : TorchModelWrapper, optional
+        Pre-built wrapper for advanced use cases (custom preprocessing,
+        custom labels, etc.).
     n_classes : int, optional
         Number of top predicted classes to explain. Default is 3.
     m_steps : int, optional
@@ -52,46 +127,23 @@ class VisualTCAV:
     cache_dir : str, optional
         Directory for caching CAVs and activations. Default is ".cache".
     cav_fn : callable, optional
-        Custom function for computing the CAV from concept and random
-        feature representations. If not provided, the default centroid
-        difference method is used.
-
-        The function must have this signature:
-
-            def cav_fn(
-                concept_features: torch.Tensor,  # [N, C] pooled concept activations
-                random_features: torch.Tensor,   # [N, C] pooled random activations
-            ) -> Cav:
-                ...
-
-        This allows researchers to plug in alternative CAV computation
-        methods (e.g. linear SVM) without modifying the package source code.
-
-    Examples
-    --------
-    Default usage (centroid difference):
-
-    >>> tcav = LocalVisualTCAV(model_wrapper=wrapper, ...)
-
-    Custom CAV function (e.g. linear SVM):
-
-    >>> def svm_cav(concept_features, random_features):
-    ...     # your custom implementation here
-    ...     return Cav(direction=my_direction)
-    >>>
-    >>> tcav = LocalVisualTCAV(model_wrapper=wrapper, cav_fn=svm_cav, ...)
+        Custom CAV computation function. Must have signature:
+        ``cav_fn(concept_features: Tensor, random_features: Tensor) -> Cav``
+        If not provided, the default centroid difference method is used.
     """
 
     def __init__(
         self,
-        model_wrapper,
+        model=None,
+        model_name: str = None,
+        model_wrapper=None,
         n_classes: int = 3,
         m_steps: int = 50,
         max_examples: int = 500,
         cache_dir: str = ".cache",
         cav_fn: Optional[Callable] = None,
     ):
-        self.model_wrapper = model_wrapper
+        self.model_wrapper = _load_model_wrapper(model, model_name, model_wrapper)
         self.n_classes = n_classes
         self.m_steps = m_steps
         self.max_examples = max_examples
@@ -106,9 +158,7 @@ class VisualTCAV:
         # Main storage: computations[layer_name][concept_name] = ConceptLayer
         self.computations = {}
 
-        self.device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Use provided CAV function or fall back to centroid difference default
         self.cav_fn = cav_fn if cav_fn is not None else self._default_cav_fn
@@ -182,13 +232,11 @@ class VisualTCAV:
         """
         Specify which CNN layers to analyze.
 
-        Call model_wrapper.info() to see available layer names.
-        Deeper layers capture higher-level concepts.
-
         Parameters
         ----------
         layer_names : list of str
             Layer names (e.g. ["layer3", "layer4"]).
+            Call model_wrapper.info() to see available layers.
 
         Raises
         ------
@@ -271,19 +319,16 @@ class VisualTCAV:
         """
         Default CAV computation using centroid difference.
 
-        Computes the CAV direction as the difference between the mean
-        concept activation (positive centroid) and the mean random
-        activation (negative centroid), as described in the original
-        Visual-TCAV paper.
-
-        This is the method used when no custom cav_fn is provided.
+        Computes the direction as the difference between the mean concept
+        activation (positive centroid) and the mean random activation
+        (negative centroid), as described in the Visual-TCAV paper.
 
         Parameters
         ----------
         concept_features : torch.Tensor
-            Pooled feature maps of concept images. Shape: [N, C].
+            Pooled concept image activations. Shape: [N, C].
         random_features : torch.Tensor
-            Pooled feature maps of random images. Shape: [N, C].
+            Pooled random image activations. Shape: [N, C].
 
         Returns
         -------
@@ -379,8 +424,7 @@ class VisualTCAV:
         Create m_steps interpolations between baseline and actual feature maps.
 
         Integrated Gradients averages gradients along a straight path from
-        a zero baseline to the actual feature maps, rather than computing
-        gradients at a single point.
+        a zero baseline to the actual feature maps, rather than at a single point.
 
         Parameters
         ----------
@@ -406,10 +450,6 @@ class VisualTCAV:
     ) -> torch.Tensor:
         """
         Compute Integrated Gradients of a class score w.r.t. feature maps.
-
-        Measures how much each feature map value contributed to the final
-        class prediction by averaging gradients across m_steps interpolations
-        between a zero baseline and the actual feature maps.
 
         Parameters
         ----------
@@ -449,9 +489,8 @@ class VisualTCAV:
         """
         Compute the raw concept map for a test image.
 
-        Analogous to GradCAM: computes a weighted sum of feature maps
-        using CAV direction components as weights, then applies ReLU
-        to keep only locations where the concept is present.
+        Analogous to GradCAM: weighted sum of feature maps using CAV direction
+        as weights, then ReLU to keep only locations where concept is present.
 
         Parameters
         ----------
@@ -514,10 +553,9 @@ class VisualTCAV:
         """
         Compute the attribution score for a concept at a layer for a class.
 
-        Combines Integrated Gradients with the concept map: IG identifies
-        which feature map values matter for the class prediction, the
-        concept map masks to regions where the concept is present, and
-        the dot product with the CAV direction yields a scalar score.
+        Combines IG with the concept map: IG identifies which feature map
+        values matter for the class, the concept map masks to regions where
+        the concept is present, and dot product with CAV yields a scalar.
 
         Parameters
         ----------
