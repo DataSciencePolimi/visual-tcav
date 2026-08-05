@@ -27,66 +27,129 @@ from visual_tcav.utils import (
 sys.dont_write_bytecode = True
 
 
-def _load_model_wrapper(model, model_name, model_wrapper):
-    """
-    Resolve the model wrapper from the three supported input styles.
+# Supported torchvision models for string-based loading
+_SUPPORTED_MODELS = {
+    "resnet18":  ("torchvision.models", "resnet18",  "ResNet18_Weights"),
+    "resnet50":  ("torchvision.models", "resnet50",  "ResNet50_Weights"),
+    "resnet101": ("torchvision.models", "resnet101", "ResNet101_Weights"),
+    "vgg16":     ("torchvision.models", "vgg16",     "VGG16_Weights"),
+    "vgg19":     ("torchvision.models", "vgg19",     "VGG19_Weights"),
+}
 
-    Supports:
-    - Style 1: model="resnet50" (string, auto-loads from torchvision)
-    - Style 2: model=my_resnet (nn.Module, wrapped automatically)
-    - Style 3: model_wrapper=my_wrapper (TorchModelWrapper, used directly)
+
+def available_layers(model) -> None:
+    """
+    Print the available CNN layers for a model.
+
+    Use this utility function before instantiating LocalVisualTCAV or
+    GlobalVisualTCAV to decide which layers to analyze.
 
     Parameters
     ----------
-    model : str or nn.Module or None
-        Model name string or PyTorch model object.
+    model : str or nn.Module
+        Model name string (e.g. "resnet50") or a PyTorch model object.
+
+    Examples
+    --------
+    >>> from visual_tcav import available_layers
+    >>> available_layers("resnet50")
+    +----------------------------+
+    |       Model: resnet50      |
+    +------------+---------------+
+    | N. classes |    Layers     |
+    +------------+---------------+
+    |    1000    |    layer1     |
+    |            |    layer2     |
+    |            |    layer3     |
+    |            |    layer4     |
+    +------------+---------------+
+
+    >>> import torchvision.models as models
+    >>> my_resnet = models.resnet50(weights='DEFAULT')
+    >>> available_layers(my_resnet)
+    """
+    wrapper = _build_wrapper(model, model_name=None)
+    wrapper.info()
+
+
+def _build_wrapper(model, model_name):
+    """
+    Build a TorchModelWrapper from a model string or nn.Module.
+
+    Parameters
+    ----------
+    model : str or nn.Module
+        Model name string (e.g. "resnet50") or PyTorch model object.
     model_name : str or None
-        Optional display name for the model.
-    model_wrapper : TorchModelWrapper or None
-        Pre-built wrapper object.
+        Optional display name. Inferred from model string if not given.
 
     Returns
     -------
     TorchModelWrapper
-        Ready-to-use model wrapper.
+        Ready-to-use wrapper with labels and preprocessing resolved.
     """
+    import torchvision.models as tv
     from visual_tcav.model_wrapper import TorchModelWrapper
 
-    if model_wrapper is not None:
-        return model_wrapper
-
     if isinstance(model, str):
-        import torchvision.models as tv_models
-        supported = {
-            "resnet18":  tv_models.resnet18,
-            "resnet50":  tv_models.resnet50,
-            "resnet101": tv_models.resnet101,
-            "vgg16":     tv_models.vgg16,
-            "vgg19":     tv_models.vgg19,
-        }
-        if model not in supported:
+        name = model.lower()
+        if name not in _SUPPORTED_MODELS:
             raise ValueError(
-                f"Model string '{model}' not supported. "
-                f"Supported names: {list(supported.keys())}. "
-                f"For other models pass an nn.Module directly."
+                f"Model '{model}' not supported for string loading.\n"
+                f"Supported: {list(_SUPPORTED_MODELS.keys())}.\n"
+                f"For other models, pass an nn.Module directly."
             )
-        loaded = supported[model](weights="DEFAULT")
+        fn_name, weights_cls = _SUPPORTED_MODELS[name][1], _SUPPORTED_MODELS[name][2]
+        fn = getattr(tv, fn_name)
+        weights = getattr(tv, weights_cls).DEFAULT
+        loaded_model = fn(weights=weights)
         return TorchModelWrapper(
-            model_name=model_name or model,
-            model=loaded,
+            model_name=model_name or name,
+            model=loaded_model,
+            labels=list(weights.meta["categories"]),
+            model_preprocess=weights.transforms(),
         )
 
     if isinstance(model, nn.Module):
-        return TorchModelWrapper(
-            model_name=model_name or "model",
-            model=model,
-        )
+        _weights_obj = None
+
+        if (
+            hasattr(model, "_weights")
+            and model._weights is not None
+            and hasattr(model._weights, "meta")
+            and "categories" in model._weights.meta
+        ):
+            _weights_obj = model._weights
+
+        if _weights_obj is None and model_name is not None:
+            _name = model_name.lower()
+            if _name in _SUPPORTED_MODELS:
+                weights_cls = _SUPPORTED_MODELS[_name][2]
+                _weights_obj = getattr(tv, weights_cls).DEFAULT
+
+        if _weights_obj is not None:
+            return TorchModelWrapper(
+                model_name=model_name or "model",
+                model=model,
+                labels=list(_weights_obj.meta["categories"]),
+                model_preprocess=_weights_obj.transforms(),
+            )
+        else:
+            raise ValueError(
+                f"Could not auto-load labels for this model.\n"
+                f"For standard torchvision models, pass model_name as one of: "
+                f"{list(_SUPPORTED_MODELS.keys())}.\n"
+                f"For custom models, use TorchModelWrapper directly:\n"
+                f"  wrapper = TorchModelWrapper(model_name='my_model', "
+                f"model=my_model, labels=[...])\n"
+                f"  tcav = LocalVisualTCAV(model_wrapper=wrapper, ...)"
+            )
 
     raise ValueError(
-        "Provide one of:\n"
-        "  model='resnet50'          (string — auto-loaded)\n"
-        "  model=my_pytorch_model    (nn.Module — wrapped automatically)\n"
-        "  model_wrapper=my_wrapper  (TorchModelWrapper — used directly)"
+        "Provide either:\n"
+        "  model='resnet50'       (string — auto-loaded)\n"
+        "  model=my_pytorch_model (nn.Module — wrapped automatically)\n"
+        "  model_wrapper=wrapper  (TorchModelWrapper — advanced use)"
     )
 
 
@@ -95,29 +158,48 @@ class VisualTCAV:
     Base class for Visual-TCAV.
 
     Implements the core pipeline shared by LocalVisualTCAV and GlobalVisualTCAV.
-    Not meant to be used directly. Use LocalVisualTCAV or GlobalVisualTCAV.
+    Not meant to be used directly — use LocalVisualTCAV or GlobalVisualTCAV.
 
-    The model can be provided in three ways (in order of simplicity):
+    Before instantiating, use the standalone utility function to inspect
+    available layers:
 
-    1. As a string — auto-loaded from torchvision:
-       ``LocalVisualTCAV(model="resnet50", ...)``
+    .. code-block:: python
 
-    2. As a PyTorch nn.Module — wrapped automatically:
-       ``LocalVisualTCAV(model=my_resnet, ...)``
+        from visual_tcav import available_layers
+        available_layers("resnet50")   # prints layer names
 
-    3. As an explicit TorchModelWrapper — for full control:
-       ``LocalVisualTCAV(model_wrapper=my_wrapper, ...)``
+    The model is provided via one of two standard interfaces:
+
+    **String** — auto-loads the model with default ImageNet weights:
+
+    .. code-block:: python
+
+        tcav = LocalVisualTCAV(model="resnet50", ...)
+
+    **nn.Module** — use your own model (fine-tuned, custom weights, etc.):
+
+    .. code-block:: python
+
+        my_model = models.resnet50(weights=ResNet50_Weights.DEFAULT)
+        tcav = LocalVisualTCAV(model=my_model, ...)
+
+    For advanced use cases (custom labels, custom preprocessing), use
+    :class:`~visual_tcav.model_wrapper.TorchModelWrapper` directly:
+
+    .. code-block:: python
+
+        wrapper = TorchModelWrapper(model_name="my_cnn", model=my_model,
+                                    labels=my_labels, model_preprocess=my_fn)
+        tcav = LocalVisualTCAV(model_wrapper=wrapper, ...)
 
     Parameters
     ----------
     model : str or nn.Module, optional
-        Model name (e.g. "resnet50") or PyTorch model object.
+        Model name string or PyTorch model object.
     model_name : str, optional
-        Display name used for caching and logging. Inferred from model
-        if not provided.
+        Display name for the model.
     model_wrapper : TorchModelWrapper, optional
-        Pre-built wrapper for advanced use cases (custom preprocessing,
-        custom labels, etc.).
+        Pre-built wrapper for advanced use cases.
     n_classes : int, optional
         Number of top predicted classes to explain. Default is 3.
     m_steps : int, optional
@@ -127,9 +209,8 @@ class VisualTCAV:
     cache_dir : str, optional
         Directory for caching CAVs and activations. Default is ".cache".
     cav_fn : callable, optional
-        Custom CAV computation function. Must have signature:
-        ``cav_fn(concept_features: Tensor, random_features: Tensor) -> Cav``
-        If not provided, the default centroid difference method is used.
+        Custom CAV computation function. Must accept two tensors of
+        shape [N, C] and return a Cav object.
     """
 
     def __init__(
@@ -143,7 +224,16 @@ class VisualTCAV:
         cache_dir: str = ".cache",
         cav_fn: Optional[Callable] = None,
     ):
-        self.model_wrapper = _load_model_wrapper(model, model_name, model_wrapper)
+        if model_wrapper is not None:
+            self.model_wrapper = model_wrapper
+        elif model is not None:
+            self.model_wrapper = _build_wrapper(model, model_name)
+        else:
+            raise ValueError(
+                "Provide either 'model' (string or nn.Module) "
+                "or 'model_wrapper' (TorchModelWrapper)."
+            )
+
         self.n_classes = n_classes
         self.m_steps = m_steps
         self.max_examples = max_examples
@@ -166,10 +256,10 @@ class VisualTCAV:
         os.makedirs(self.cache_dir, exist_ok=True)
 
     # -----------------------------------------------------------------------
-    # Setup
+    # Internal setup — called by subclass constructors only
     # -----------------------------------------------------------------------
 
-    def set_concepts(
+    def _setup_concepts(
         self,
         concept_names: list,
         concept_dirs: dict = None,
@@ -177,7 +267,7 @@ class VisualTCAV:
         random_dir: str = None,
     ) -> None:
         """
-        Specify which concepts to analyze.
+        Configure concepts. Called internally by the constructor.
 
         Parameters
         ----------
@@ -185,10 +275,11 @@ class VisualTCAV:
             Names of the concepts (e.g. ["striped", "dotted"]).
         concept_dirs : dict, optional
             Explicit mapping of concept name to image folder path.
+            Takes priority over concept_base_dir.
         concept_base_dir : str, optional
             Base folder containing one subfolder per concept.
         random_dir : str, optional
-            Folder containing random (negative) images.
+            Folder containing random images used as reference distribution.
 
         Raises
         ------
@@ -205,7 +296,8 @@ class VisualTCAV:
             }
         else:
             raise ValueError(
-                "Provide either 'concept_dirs' or 'concept_base_dir'."
+                "Provide either 'concept_dirs' (explicit path per concept) "
+                "or 'concept_base_dir' (folder containing one subfolder per concept)."
             )
 
         for name, path in self.concept_dirs.items():
@@ -219,24 +311,26 @@ class VisualTCAV:
         if random_dir is not None:
             self.random_dir = random_dir
         elif concept_base_dir is not None:
+            # Convention: random images live in a subfolder named "random"
             self.random_dir = os.path.join(concept_base_dir, "random")
 
         if self.random_dir and not os.path.exists(self.random_dir):
             raise ValueError(
-                f"Random images folder not found at: {self.random_dir}"
+                f"Random images folder not found at: {self.random_dir}\n"
+                f"Pass random_dir explicitly or create a 'random' subfolder "
+                f"inside concept_base_dir."
             )
 
         print(f"Concepts set: {self.concept_names}")
 
-    def set_layers(self, layer_names: list) -> None:
+    def _setup_layers(self, layer_names: list) -> None:
         """
-        Specify which CNN layers to analyze.
+        Configure layers. Called internally by the constructor.
 
         Parameters
         ----------
         layer_names : list of str
             Layer names (e.g. ["layer3", "layer4"]).
-            Call model_wrapper.info() to see available layers.
 
         Raises
         ------
@@ -245,8 +339,8 @@ class VisualTCAV:
         """
         if not layer_names:
             raise ValueError(
-                "Provide at least one layer name. "
-                "Call model_wrapper.info() to see available layers."
+                "Provide at least one layer name.\n"
+                "Use available_layers(model) to see valid layer names."
             )
         self.layer_names = layer_names
         self.computations = {
@@ -265,7 +359,7 @@ class VisualTCAV:
         """
         Compute (or load) pooled activations of random images at a layer.
 
-        Random images serve as negative examples for CAV computation.
+        Random images serve as the reference distribution for CAV computation.
         Global Average Pooling reduces [N, C, H, W] to [N, C] so that
         each image is represented as a single vector.
 
@@ -292,8 +386,8 @@ class VisualTCAV:
 
         if self.random_dir is None:
             raise ValueError(
-                "Random images directory not set. "
-                "Call set_concepts() with the random_dir parameter."
+                "random_dir not set. Pass it to the constructor:\n"
+                "  LocalVisualTCAV(..., random_dir='./path/to/random/images', ...)"
             )
 
         print(f"  Computing random activations at '{layer_name}'...")
@@ -320,8 +414,8 @@ class VisualTCAV:
         Default CAV computation using centroid difference.
 
         Computes the direction as the difference between the mean concept
-        activation (positive centroid) and the mean random activation
-        (negative centroid), as described in the Visual-TCAV paper.
+        activation (concept centroid) and the mean random image activation
+        (random centroid), as described in the Visual-TCAV paper.
 
         Parameters
         ----------
@@ -335,11 +429,11 @@ class VisualTCAV:
         Cav
             CAV with direction, centroids, and concept emblem set.
         """
-        positive_centroid = torch.mean(concept_features, dim=0)
-        negative_centroid = torch.mean(random_features, dim=0)
+        concept_centroid = torch.mean(concept_features, dim=0)
+        random_centroid = torch.mean(random_features, dim=0)
 
-        # Direction points from "random" toward "concept" in feature space
-        direction = positive_centroid - negative_centroid
+        # Direction points from random toward concept in feature space
+        direction = concept_centroid - random_centroid
 
         # Concept emblem: scale factor for concept map normalization
         concept_emblem = contraharmonic_mean(
@@ -348,8 +442,8 @@ class VisualTCAV:
         concept_emblem = torch.mean(concept_emblem, dim=0)
 
         return Cav(
-            concept_centroid=positive_centroid,
-            negative_centroid=negative_centroid,
+            concept_centroid=concept_centroid,
+            negative_centroid=random_centroid,
             direction=direction,
             concept_emblem=concept_emblem,
         )
@@ -508,7 +602,7 @@ class VisualTCAV:
         direction = cav.direction.to(self.device).view(-1, 1, 1)
         weighted = feature_maps.squeeze(0) * direction
         raw_map = weighted.sum(dim=0)
-        # Negative values indicate the concept is absent — discard them
+        # Values below zero indicate the concept is absent — discard them
         return F.relu(raw_map)
 
     def _normalize_concept_map(
@@ -522,6 +616,10 @@ class VisualTCAV:
         Without normalization, concept maps from different concepts or images
         are not comparable due to differing absolute activation scales.
 
+        If no concept emblem is available (e.g. when using a custom cav_fn
+        that does not compute it), falls back to normalizing by the map's
+        own maximum value.
+
         Parameters
         ----------
         raw_map : torch.Tensor
@@ -534,8 +632,13 @@ class VisualTCAV:
         torch.Tensor
             Normalized concept map with values in [0, 1].
         """
-        concept_emblem = cav.concept_emblem.to(self.device)
-        scale = torch.mean(concept_emblem) + 1e-10
+        if cav.concept_emblem is not None:
+            concept_emblem = cav.concept_emblem.to(self.device)
+            scale = torch.mean(concept_emblem) + 1e-10
+        else:
+            # Fallback when custom cav_fn does not provide a concept emblem
+            scale = raw_map.max() + 1e-10
+
         return torch.clamp(raw_map / scale, 0.0, 1.0)
 
     # -----------------------------------------------------------------------

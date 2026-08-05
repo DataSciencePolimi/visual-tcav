@@ -27,12 +27,55 @@ class GlobalVisualTCAV(VisualTCAV):
     """
     Explains a class of images using Visual-TCAV.
 
+    Runs the pipeline on a folder of test images and summarizes attribution
+    scores statistically, answering:
+
+    **Does this concept consistently influence predictions for this class?**
+
+    The model is provided via one of two standard interfaces:
+
+    **String** — auto-loads the model with default ImageNet weights:
+
+    .. code-block:: python
+
+        tcav = GlobalVisualTCAV(
+            model="resnet50",
+            test_images_dir="./images/zebra",
+            concept_names=["striped", "dotted"],
+            concept_base_dir="./concept_images",
+            layer_names=["layer4"],
+        )
+        tcav.explain()
+        tcav.statsInfo()
+        tcav.plot()
+
+    **nn.Module** — use your own model:
+
+    .. code-block:: python
+
+        import torchvision.models as models
+        resnet = models.resnet50(weights='DEFAULT')
+        tcav = GlobalVisualTCAV(
+            model=resnet,
+            model_name="resnet50",
+            ...
+        )
+
+    All parameters are optional at construction time. Validation happens
+    when explain() is called, so you can create the object first and
+    inspect available layers with model_wrapper.info() before configuring.
+
     Parameters
     ----------
-    model_wrapper : TorchModelWrapper
-        The wrapped PyTorch model to explain.
+    model : str or nn.Module, optional
+        Model name string or PyTorch model object.
+    model_name : str, optional
+        Display name for the model. For nn.Module of known torchvision
+        models, set this to enable auto-loading of labels.
+    model_wrapper : TorchModelWrapper, optional
+        Pre-built wrapper for advanced use cases.
     test_images_dir : str, optional
-        Folder containing test images (one class).
+        Folder containing test images of ONE class (e.g. 50 zebra photos).
     concept_names : list of str, optional
         Names of the concepts to analyze.
     concept_base_dir : str, optional
@@ -40,7 +83,8 @@ class GlobalVisualTCAV(VisualTCAV):
     concept_dirs : dict, optional
         Explicit mapping of concept name to image folder.
     random_dir : str, optional
-        Folder containing random (negative) images.
+        Folder containing random images used as reference distribution.
+        Defaults to concept_base_dir/random/ if not provided.
     layer_names : list of str, optional
         CNN layers to analyze.
     n_classes : int, optional
@@ -53,30 +97,16 @@ class GlobalVisualTCAV(VisualTCAV):
         Maximum number of test images to process. Default is 50.
     cache_dir : str, optional
         Directory for caching results. Default is ".cache".
-
-    Examples
-    --------
-    >>> import torchvision.models as models
-    >>> from visual_tcav import GlobalVisualTCAV, TorchModelWrapper
-    >>>
-    >>> resnet = models.resnet50(weights='DEFAULT')
-    >>> wrapper = TorchModelWrapper(model_name="resnet50", model=resnet)
-    >>>
-    >>> tcav = GlobalVisualTCAV(
-    ...     model_wrapper=wrapper,
-    ...     test_images_dir="./images/zebra",
-    ...     concept_names=["striped", "dotted"],
-    ...     concept_base_dir="./concept_images",
-    ...     layer_names=["layer4"],
-    ... )
-    >>> tcav.explain()
-    >>> tcav.statsInfo()
-    >>> tcav.plot()
+    cav_fn : callable, optional
+        Custom CAV computation function. Must accept two tensors of
+        shape [N, C] and return a Cav object.
     """
 
     def __init__(
         self,
-        model_wrapper,
+        model=None,
+        model_name: str = None,
+        model_wrapper=None,
         test_images_dir: str = None,
         concept_names: list = None,
         concept_base_dir: str = None,
@@ -88,13 +118,17 @@ class GlobalVisualTCAV(VisualTCAV):
         max_examples: int = 500,
         max_test_images: int = 50,
         cache_dir: str = ".cache",
+        cav_fn=None,
     ):
         super().__init__(
+            model=model,
+            model_name=model_name,
             model_wrapper=model_wrapper,
             n_classes=n_classes,
             m_steps=m_steps,
             max_examples=max_examples,
             cache_dir=cache_dir,
+            cav_fn=cav_fn,
         )
 
         self.max_test_images = max_test_images
@@ -103,10 +137,10 @@ class GlobalVisualTCAV(VisualTCAV):
         self.stats = {}
 
         if test_images_dir is not None:
-            self.set_test_images_dir(test_images_dir)
+            self._load_test_images(test_images_dir)
 
         if concept_names is not None:
-            self.set_concepts(
+            self._setup_concepts(
                 concept_names=concept_names,
                 concept_dirs=concept_dirs,
                 concept_base_dir=concept_base_dir,
@@ -114,22 +148,20 @@ class GlobalVisualTCAV(VisualTCAV):
             )
 
         if layer_names is not None:
-            self.set_layers(layer_names)
+            self._setup_layers(layer_names)
 
     # -----------------------------------------------------------------------
-    # Setup
+    # Image loading
     # -----------------------------------------------------------------------
 
-    def set_test_images_dir(self, images_dir: str) -> None:
+    def _load_test_images(self, images_dir: str) -> None:
         """
         Load all image paths from a folder.
-
-        The folder should contain images of ONE class (e.g. 50 zebra photos).
 
         Parameters
         ----------
         images_dir : str
-            Path to the folder of test images.
+            Folder containing test images of ONE class.
 
         Raises
         ------
@@ -157,7 +189,7 @@ class GlobalVisualTCAV(VisualTCAV):
 
         self.test_image_paths = all_files[: self.max_test_images]
         print(
-            f"Test images loaded: {len(self.test_image_paths)} images "
+            f"Test images loaded: {len(self.test_image_paths)} "
             f"from {images_dir}"
         )
 
@@ -174,11 +206,16 @@ class GlobalVisualTCAV(VisualTCAV):
         Run the Visual-TCAV pipeline on all test images and compute statistics.
 
         Three-phase pipeline:
-        Phase 1 — Compute CAVs once per (layer, concept) pair. CAVs depend
-                  only on concept images, not test images, so they are shared.
-        Phase 2 — Process each test image: extract feature maps, compute
-                  concept map and attribution scores, append to raw lists.
-        Phase 3 — Wrap each list of scores in a Stat object (mean, std, CI).
+
+        **Phase 1** — Compute CAVs once per (layer, concept) pair. CAVs only
+        depend on concept images, not test images, so they are shared
+        across all test images.
+
+        **Phase 2** — Process each test image: extract feature maps, compute
+        concept map and attribution scores, append to raw score lists.
+
+        **Phase 3** — Wrap each list of scores in a Stat object
+        (mean, std, 95% confidence interval).
 
         Parameters
         ----------
@@ -190,16 +227,34 @@ class GlobalVisualTCAV(VisualTCAV):
         Raises
         ------
         RuntimeError
-            If test images, concepts, or layers have not been set.
+            If test images, concepts, or layers have not been configured.
         """
-        self._check_ready()
+        # Validate configuration — errors here are informative and actionable
+        if not self.test_image_paths:
+            raise RuntimeError(
+                "test_images_dir not set. Pass it to the constructor:\n"
+                "  GlobalVisualTCAV(model='resnet50', "
+                "test_images_dir='./images/zebra', ...)"
+            )
+        if not self.concept_names:
+            raise RuntimeError(
+                "concept_names not set. Pass it to the constructor:\n"
+                "  GlobalVisualTCAV(..., concept_names=['striped', 'dotted'], "
+                "concept_base_dir='./concept_images', ...)"
+            )
+        if not self.layer_names:
+            raise RuntimeError(
+                "layer_names not set. Pass it to the constructor:\n"
+                "  GlobalVisualTCAV(..., layer_names=['layer4'], ...)\n"
+                "Call model_wrapper.info() to see available layer names."
+            )
 
         print(f"\nRunning GlobalVisualTCAV explanation...")
         print(f"  Images:   {len(self.test_image_paths)} test images")
         print(f"  Layers:   {self.layer_names}")
         print(f"  Concepts: {self.concept_names}\n")
 
-        # raw_attributions[layer][concept][rank] = list of scores (one per image)
+        # raw_attributions[layer][concept][rank] = list of scores
         # Rank is used instead of class index because different images may have
         # slightly different top predictions; rank ensures consistent comparison
         raw_attributions = {
@@ -261,7 +316,7 @@ class GlobalVisualTCAV(VisualTCAV):
                             attribution.item()
                         )
 
-        # Phase 3: compute statistics from collected attribution scores
+        # Phase 3: compute statistics from collected scores
         print("\nPhase 3: Computing statistics...")
         self.stats = {}
         for layer_name in self.layer_names:
@@ -283,15 +338,20 @@ class GlobalVisualTCAV(VisualTCAV):
         """
         Print a table summarizing attribution statistics across all test images.
 
-        Shows mean attribution, standard deviation, and 95% confidence
-        interval for each (concept, layer, class) combination.
+        For each (concept, layer, class) combination shows:
+        - Mean attribution score
+        - Standard deviation
+        - 95% confidence interval
 
         Raises
         ------
         RuntimeError
             If explain() has not been called yet.
         """
-        self._check_explained()
+        if not self.stats:
+            raise RuntimeError(
+                "No results found. Call explain() before statsInfo()."
+            )
 
         from prettytable import PrettyTable
 
@@ -342,20 +402,23 @@ class GlobalVisualTCAV(VisualTCAV):
         figsize : tuple, optional
             Figure size as (width, height). Auto-computed if not provided.
         save_path : str, optional
-            If provided, saves the figure to disk.
+            If provided, saves the figure to disk instead of displaying.
 
         Raises
         ------
         RuntimeError
             If explain() has not been called yet.
         """
-        self._check_explained()
+        if not self.stats:
+            raise RuntimeError(
+                "No results found. Call explain() before plot()."
+            )
 
         n_layers = len(self.layer_names)
         n_concepts = len(self.concept_names)
 
         if figsize is None:
-            figsize = (n_layers * 6, 5)
+            figsize = (max(n_layers * 6, 8), 5)
 
         fig, axes = plt.subplots(1, n_layers, figsize=figsize)
         if n_layers == 1:
@@ -379,7 +442,9 @@ class GlobalVisualTCAV(VisualTCAV):
                     if rank in self.stats[layer_name][concept_name]:
                         stat = self.stats[layer_name][concept_name][rank]
                         means.append(stat.mean.item())
-                        errors.append((stat.end.item() - stat.begin.item()) / 2)
+                        errors.append(
+                            (stat.end.item() - stat.begin.item()) / 2
+                        )
                     else:
                         means.append(0.0)
                         errors.append(0.0)
@@ -398,7 +463,8 @@ class GlobalVisualTCAV(VisualTCAV):
 
             class_labels = [
                 self.model_wrapper.id_to_label(self.target_classes[r])
-                if r < len(self.target_classes) else f"class_{r}"
+                if r < len(self.target_classes)
+                else f"class_{r}"
                 for r in range(self.n_classes)
             ]
 
@@ -453,23 +519,3 @@ class GlobalVisualTCAV(VisualTCAV):
         ])
 
         return preprocess(image).unsqueeze(0)
-
-    def _check_ready(self) -> None:
-        if not self.test_image_paths:
-            raise RuntimeError(
-                "No test images set. Call set_test_images_dir() first."
-            )
-        if not self.concept_names:
-            raise RuntimeError(
-                "No concepts set. Call set_concepts() first."
-            )
-        if not self.layer_names:
-            raise RuntimeError(
-                "No layers set. Call set_layers() first."
-            )
-
-    def _check_explained(self) -> None:
-        if not self.stats:
-            raise RuntimeError(
-                "No results found. Call explain() before statsInfo() or plot()."
-            )

@@ -12,10 +12,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from PIL import Image
 from prettytable import PrettyTable
 
 sys.dont_write_bytecode = True
+
+
+# Mapping of known torchvision model names to their default weights.
+# Used to auto-load labels and preprocessing when no explicit values are given.
+_TORCHVISION_WEIGHTS = None
+
+
+def _get_torchvision_weights():
+    """Lazy-load the torchvision weights map to avoid import overhead."""
+    global _TORCHVISION_WEIGHTS
+    if _TORCHVISION_WEIGHTS is None:
+        import torchvision.models as tv
+        _TORCHVISION_WEIGHTS = {
+            "resnet18":  tv.ResNet18_Weights.DEFAULT,
+            "resnet50":  tv.ResNet50_Weights.DEFAULT,
+            "resnet101": tv.ResNet101_Weights.DEFAULT,
+            "vgg16":     tv.VGG16_Weights.DEFAULT,
+            "vgg19":     tv.VGG19_Weights.DEFAULT,
+        }
+    return _TORCHVISION_WEIGHTS
 
 
 def _safe_batch_size(n_samples: int, desired: int = 32) -> int:
@@ -58,7 +77,6 @@ class _FeatureMapsModel(nn.Module):
 
     def __init__(self, model: nn.Module, layer_name: str):
         super().__init__()
-
         children = list(model.named_children())
         names, modules = zip(*children)
 
@@ -93,7 +111,6 @@ class _LogitsModel(nn.Module):
 
     def __init__(self, model: nn.Module, layer_name: str):
         super().__init__()
-
         children = list(model.named_children())
         names, modules = zip(*children)
 
@@ -125,10 +142,18 @@ class TorchModelWrapper:
     Handles model loading, preprocessing, label management, and exposes
     methods to extract predictions, feature maps, and gradients at any layer.
 
+    Labels and preprocessing are resolved in this order:
+    1. Explicit ``labels`` / ``model_preprocess`` parameters (highest priority)
+    2. torchvision ``_weights`` attribute on the model object
+    3. Auto-lookup by ``model_name`` in the known torchvision weights map
+    4. Safe defaults (Identity preprocessing, error for missing labels)
+
     Parameters
     ----------
     model_name : str
         A name for this model, used for caching and display.
+        For known torchvision models (e.g. "resnet50"), labels and
+        preprocessing are auto-loaded if not provided explicitly.
     model : nn.Module, optional
         A PyTorch model already loaded in memory.
     model_path : str, optional
@@ -139,9 +164,8 @@ class TorchModelWrapper:
         Path to a text file with one class name per line.
     model_preprocess : callable, optional
         Preprocessing function applied to images before inference.
-        Auto-loaded from model._weights if not provided.
     input_size : tuple, optional
-        Expected input size as (C, H, W). Inferred automatically if omitted.
+        Expected input size as (C, H, W). Default is (3, 224, 224).
     batch_size : int, optional
         Default batch size for processing multiple images. Default: 32.
 
@@ -168,6 +192,7 @@ class TorchModelWrapper:
         self.model_name = model_name
         self.batch_size = batch_size
 
+        # --- Load model ---
         if model is not None:
             self.model = model
         elif model_path is not None:
@@ -184,45 +209,61 @@ class TorchModelWrapper:
         # eval() disables dropout and batchnorm updates during inference
         self.model.eval()
 
-        if model_preprocess is not None:
-            self.model_preprocess = model_preprocess
-        elif (
+        # --- Resolve weights object for auto-loading ---
+        # Try three sources in order of priority:
+        # 1. model._weights attribute (set by torchvision when loading with weights=)
+        # 2. known weights map keyed by model_name
+        _weights_obj = None
+        if (
             hasattr(self.model, "_weights")
             and self.model._weights is not None
-            and hasattr(self.model._weights, "transforms")
+            and hasattr(self.model._weights, "meta")
         ):
-            self.model_preprocess = self.model._weights.transforms()
+            _weights_obj = self.model._weights
+        else:
+            # Normalize model_name for lookup (e.g. "ResNet50" -> "resnet50")
+            _name_normalized = model_name.lower().replace("-", "").replace("_", "")
+            _weights_map = _get_torchvision_weights()
+            # Try exact match first, then normalized
+            if model_name in _weights_map:
+                _weights_obj = _weights_map[model_name]
+            elif _name_normalized in _weights_map:
+                _weights_obj = _weights_map[_name_normalized]
+
+        # --- Load preprocessing ---
+        if model_preprocess is not None:
+            self.model_preprocess = model_preprocess
+        elif _weights_obj is not None and hasattr(_weights_obj, "transforms"):
+            self.model_preprocess = _weights_obj.transforms()
         else:
             self.model_preprocess = nn.Identity()
 
+        # --- Infer input size ---
         if input_size is not None:
             self.input_size = input_size
-        elif (
-            hasattr(self.model, "_weights")
-            and self.model._weights is not None
-            and hasattr(self.model._weights, "transforms")
-        ):
+        elif _weights_obj is not None and hasattr(_weights_obj, "transforms"):
             dummy = torch.randn(3, 512, 512)
-            processed = self.model._weights.transforms()(dummy)
+            processed = _weights_obj.transforms()(dummy)
             self.input_size = tuple(processed.shape)
         else:
             self.input_size = (3, 224, 224)
 
+        # --- Load labels ---
         if labels is not None:
-            self.labels = labels
+            self.labels = list(labels)
         elif labels_path is not None:
             with open(labels_path, "r") as f:
                 self.labels = f.read().splitlines()
-        elif (
-            hasattr(self.model, "_weights")
-            and self.model._weights is not None
-            and "categories" in self.model._weights.meta
-        ):
-            self.labels = self.model._weights.meta["categories"]
+        elif _weights_obj is not None and "categories" in _weights_obj.meta:
+            self.labels = list(_weights_obj.meta["categories"])
         else:
             raise ValueError(
-                "Provide either 'labels' (a list of class names) "
-                "or 'labels_path' (path to a text file with class names)."
+                f"Could not auto-load labels for model '{model_name}'.\n"
+                f"Provide either:\n"
+                f"  labels=['class1', 'class2', ...]  (list of class names)\n"
+                f"  labels_path='path/to/labels.txt'  (text file, one class per line)\n"
+                f"For standard torchvision models, pass model_name as one of: "
+                f"{list(_get_torchvision_weights().keys())}"
             )
 
         self.binary_classification = len(self.labels) == 2

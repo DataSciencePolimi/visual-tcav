@@ -8,48 +8,48 @@ Given an image and a human concept (e.g. "stripes"), Visual-TCAV produces:
 - A concept map: a heatmap showing WHERE the CNN detected that concept
 - An attribution score: measuring HOW MUCH the concept influenced the prediction
 
-This package implements Visual-TCAV in PyTorch, based on:
-    De Santis et al., "Visual-TCAV: Concept-based Attribution and Saliency
-    Maps for Post-hoc Explainability in Image Classification", 2025.
-    https://github.com/DataSciencePolimi/Visual-TCAV
-
-It also includes the Text-to-Concept extension by Daniele Di Santi (2025),
-which enables CAV generation from plain text instead of concept images,
-using CLIP and a trained Linear Aligner.
-
-Basic usage
+Quick start
 -----------
->>> import torchvision.models as models
->>> from visual_tcav import LocalVisualTCAV, TorchModelWrapper
+>>> from visual_tcav import available_layers, LocalVisualTCAV
 >>>
->>> resnet = models.resnet50(weights='DEFAULT')
->>> wrapper = TorchModelWrapper(model_name="resnet50", model=resnet)
+>>> # Step 1: inspect available layers before configuring
+>>> available_layers("resnet50")
 >>>
+>>> # Step 2: instantiate with all configuration
 >>> tcav = LocalVisualTCAV(
-...     model_wrapper=wrapper,
+...     model="resnet50",
 ...     test_image_path="./zebra.jpg",
 ...     concept_names=["striped", "dotted"],
 ...     concept_base_dir="./concept_images",
+...     random_dir="./concept_images/random",
 ...     layer_names=["layer4"],
+...     cache_dir="./cache",
 ... )
->>> tcav.predict().info()
 >>> tcav.explain()
 >>> tcav.plot()
 
-Text-to-Concept usage
----------------------
->>> from visual_tcav import TextToConcept
->>>
->>> t2c = TextToConcept(model_wrapper=wrapper)
->>> t2c.load_aligner("./aligners/resnet50_layer4.pt")
->>> cav = t2c.get_cav_from_text("stripes", layer_name="layer4")
+Based on:
+    De Santis et al., "Visual-TCAV: Concept-based Attribution and Saliency
+    Maps for Post-hoc Explainability in Image Classification", 2025.
+    https://arxiv.org/abs/2411.05698
+
+Text-to-Concept extension by Daniele Di Santi (2025), based on:
+    Moayeri et al., "Text-To-Concept (and Back) via Cross-Model Alignment",
+    arXiv:2305.06386, 2023.
 """
 
-from visual_tcav.model_wrapper import TorchModelWrapper
+# Main public API
 from visual_tcav.local_tcav import LocalVisualTCAV
 from visual_tcav.global_tcav import GlobalVisualTCAV
+
+# Utility function — inspect model layers before instantiating
+from visual_tcav.visual_tcav import available_layers
+
+# Text-to-Concept extension
 from visual_tcav.text_to_concept import TextToConcept
 from visual_tcav.linear_aligner import LinearAligner
+
+# Data classes for advanced users
 from visual_tcav.utils import (
     Cav,
     ConceptLayer,
@@ -60,22 +60,26 @@ from visual_tcav.utils import (
     DEFAULT_COLORMAP,
 )
 
+# Advanced: explicit model wrapper for custom models
+# Most users do not need this — pass model= to LocalVisualTCAV instead
+from visual_tcav.model_wrapper import TorchModelWrapper
+
 # Package metadata
 __version__ = "0.1.0"
 __author__ = "Sara Cavallini"
-__email__ = ""
+__email__ = "saracavallini01@gmail.com"
 __license__ = "MIT"
 
-# Defines the public API — what `from visual_tcav import *` exposes
 __all__ = [
-    # Main classes — what most users will import
+    # Main classes
     "LocalVisualTCAV",
     "GlobalVisualTCAV",
-    "TorchModelWrapper",
+    # Utility
+    "available_layers",
     # Text-to-Concept extension
     "TextToConcept",
     "LinearAligner",
-    # Data classes — for advanced users
+    # Data classes
     "Cav",
     "ConceptLayer",
     "Prediction",
@@ -83,4 +87,6 @@ __all__ = [
     "Stat",
     "CustomColormap",
     "DEFAULT_COLORMAP",
+    # Advanced
+    "TorchModelWrapper",
 ]

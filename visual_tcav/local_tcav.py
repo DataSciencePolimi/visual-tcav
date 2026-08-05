@@ -2,6 +2,10 @@
 local_tcav.py
 -------------
 LocalVisualTCAV: explains a single test image using Visual-TCAV.
+
+For each (concept, layer) pair, produces:
+- A concept map: heatmap showing WHERE the CNN detected the concept
+- Attribution scores: HOW MUCH the concept influenced each predicted class
 """
 
 import os
@@ -23,18 +27,50 @@ class LocalVisualTCAV(VisualTCAV):
     """
     Explains a single test image using Visual-TCAV.
 
-    The model can be provided in three ways:
+    The model is provided via one of two standard interfaces:
 
-    1. String: ``LocalVisualTCAV(model="resnet50", ...)``
-    2. nn.Module: ``LocalVisualTCAV(model=my_resnet, ...)``
-    3. TorchModelWrapper: ``LocalVisualTCAV(model_wrapper=wrapper, ...)``
+    **String** — auto-loads the model with default ImageNet weights:
+
+    .. code-block:: python
+
+        tcav = LocalVisualTCAV(
+            model="resnet50",
+            test_image_path="./zebra.jpg",
+            concept_names=["striped", "dotted"],
+            concept_base_dir="./concept_images",
+            layer_names=["layer4"],
+        )
+        tcav.explain()
+        tcav.plot()
+
+    **nn.Module** — use your own model:
+
+    .. code-block:: python
+
+        import torchvision.models as models
+        resnet = models.resnet50(weights='DEFAULT')
+        tcav = LocalVisualTCAV(
+            model=resnet,
+            model_name="resnet50",
+            ...
+        )
+
+    For advanced use cases (custom labels, custom preprocessing), use
+    :class:`~visual_tcav.model_wrapper.TorchModelWrapper` directly and
+    pass it via ``model_wrapper``.
+
+    All parameters are optional at construction time. Validation happens
+    when explain() is called, so you can create the object first and
+    inspect available layers with model_wrapper.info() before configuring.
 
     Parameters
     ----------
     model : str or nn.Module, optional
-        Model name or PyTorch model object.
+        Model name string or PyTorch model object.
     model_name : str, optional
-        Display name for the model.
+        Display name for the model. For nn.Module of known torchvision
+        models, set this to enable auto-loading of labels
+        (e.g. model_name="resnet50").
     model_wrapper : TorchModelWrapper, optional
         Pre-built wrapper for advanced use cases.
     test_image_path : str, optional
@@ -46,9 +82,11 @@ class LocalVisualTCAV(VisualTCAV):
     concept_dirs : dict, optional
         Explicit mapping of concept name to image folder.
     random_dir : str, optional
-        Folder containing random (negative) images.
+        Folder containing random images used as reference distribution.
+        Defaults to concept_base_dir/random/ if not provided.
     layer_names : list of str, optional
-        CNN layers to analyze.
+        CNN layers to analyze. Call model_wrapper.info() to see
+        available layer names.
     n_classes : int, optional
         Number of top predicted classes to explain. Default is 3.
     m_steps : int, optional
@@ -58,27 +96,8 @@ class LocalVisualTCAV(VisualTCAV):
     cache_dir : str, optional
         Directory for caching results. Default is ".cache".
     cav_fn : callable, optional
-        Custom CAV computation function.
-
-    Examples
-    --------
-    Minimal usage with model string:
-
-    >>> tcav = LocalVisualTCAV(
-    ...     model="resnet50",
-    ...     test_image_path="./zebra.jpg",
-    ...     concept_names=["striped"],
-    ...     concept_base_dir="./concept_images",
-    ...     layer_names=["layer4"],
-    ... )
-    >>> tcav.explain()
-    >>> tcav.plot()
-
-    With explicit model object:
-
-    >>> import torchvision.models as models
-    >>> resnet = models.resnet50(weights='DEFAULT')
-    >>> tcav = LocalVisualTCAV(model=resnet, ...)
+        Custom CAV computation function. Must accept two tensors of
+        shape [N, C] and return a Cav object.
     """
 
     def __init__(
@@ -114,10 +133,10 @@ class LocalVisualTCAV(VisualTCAV):
         self.test_image_display = None
 
         if test_image_path is not None:
-            self.set_test_image(test_image_path)
+            self._load_test_image(test_image_path)
 
         if concept_names is not None:
-            self.set_concepts(
+            self._setup_concepts(
                 concept_names=concept_names,
                 concept_dirs=concept_dirs,
                 concept_base_dir=concept_base_dir,
@@ -125,15 +144,15 @@ class LocalVisualTCAV(VisualTCAV):
             )
 
         if layer_names is not None:
-            self.set_layers(layer_names)
+            self._setup_layers(layer_names)
 
     # -----------------------------------------------------------------------
-    # Setup
+    # Image loading
     # -----------------------------------------------------------------------
 
-    def set_test_image(self, image_path: str) -> None:
+    def _load_test_image(self, image_path: str) -> None:
         """
-        Load and preprocess a test image.
+        Load and preprocess the test image.
 
         Creates two versions:
         - A normalized tensor for model inference
@@ -142,7 +161,7 @@ class LocalVisualTCAV(VisualTCAV):
         Parameters
         ----------
         image_path : str
-            Path to the image file.
+            Path to the image file (JPEG, PNG, or other PIL-supported formats).
 
         Raises
         ------
@@ -157,7 +176,10 @@ class LocalVisualTCAV(VisualTCAV):
         C, H, W = self.model_wrapper.input_size
 
         preprocess = transforms.Compose([
-            transforms.Resize((H, W), interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.Resize(
+                (H, W),
+                interpolation=transforms.InterpolationMode.BILINEAR
+            ),
             transforms.CenterCrop((H, W)),
             transforms.ToTensor(),
             self.model_wrapper.model_preprocess,
@@ -167,7 +189,10 @@ class LocalVisualTCAV(VisualTCAV):
 
         # Unnormalized image for overlaying concept map heatmaps in plot()
         display_transform = transforms.Compose([
-            transforms.Resize((H, W), interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.Resize(
+                (H, W),
+                interpolation=transforms.InterpolationMode.BILINEAR
+            ),
             transforms.CenterCrop((H, W)),
         ])
         self.test_image_display = display_transform(image)
@@ -185,14 +210,19 @@ class LocalVisualTCAV(VisualTCAV):
         Returns
         -------
         Predictions
-            Top-k predicted classes. Call .info() to print a table.
+            Top-k predicted classes. Call .info() to print a formatted table.
 
         Raises
         ------
         RuntimeError
             If no test image has been set.
         """
-        self._check_test_image()
+        if self.test_image_tensor is None:
+            raise RuntimeError(
+                "test_image_path not set. Pass it to the constructor:\n"
+                "  LocalVisualTCAV(model='resnet50', "
+                "test_image_path='./image.jpg', ...)"
+            )
         return super().predict(self.test_image_tensor, self.test_image_path)
 
     # -----------------------------------------------------------------------
@@ -208,31 +238,61 @@ class LocalVisualTCAV(VisualTCAV):
         Run the full Visual-TCAV explanation pipeline on the test image.
 
         Automatically calls predict() if it has not been called yet,
-        so explicit predict() calls are never required.
+        so explicit predict() calls are never required before explain().
+
+        For each (layer, concept) pair:
+        1. Computes or loads random activations (reference distribution)
+        2. Computes or loads the CAV
+        3. Extracts feature maps from the test image
+        4. Computes and normalizes the concept map
+        5. Computes attribution scores for each target class
+
+        Results are stored in self.computations and visualized with plot().
 
         Parameters
         ----------
         cache_cav : bool
-            Save/load CAVs from disk. Default is True.
+            Save/load CAVs from disk to avoid recomputation. Default is True.
         cache_random : bool
             Save/load random activations from disk. Default is True.
 
         Raises
         ------
         RuntimeError
-            If test image, concepts, or layers have not been set.
+            If test image, concepts, or layers have not been configured.
         """
+        # Validate configuration — errors here are informative and actionable
+        if self.test_image_tensor is None:
+            raise RuntimeError(
+                "test_image_path not set. Pass it to the constructor:\n"
+                "  LocalVisualTCAV(model='resnet50', "
+                "test_image_path='./image.jpg', ...)"
+            )
+        if not self.concept_names:
+            raise RuntimeError(
+                "concept_names not set. Pass it to the constructor:\n"
+                "  LocalVisualTCAV(..., concept_names=['striped', 'dotted'], "
+                "concept_base_dir='./concept_images', ...)"
+            )
+        if not self.layer_names:
+            raise RuntimeError(
+                "layer_names not set. Pass it to the constructor:\n"
+                "  LocalVisualTCAV(..., layer_names=['layer4'], ...)\n"
+                "Call model_wrapper.info() to see available layer names."
+            )
+
         # Auto-call predict() so the user is never blocked by a missing call
         if not self.target_classes:
             self.predict()
-
-        self._check_ready()
 
         print(f"\nRunning LocalVisualTCAV explanation...")
         print(f"  Image:    {os.path.basename(self.test_image_path)}")
         print(f"  Layers:   {self.layer_names}")
         print(f"  Concepts: {self.concept_names}")
-        print(f"  Classes:  {[self.model_wrapper.id_to_label(i) for i in self.target_classes]}\n")
+        print(
+            f"  Classes:  "
+            f"{[self.model_wrapper.id_to_label(i) for i in self.target_classes]}\n"
+        )
 
         for layer_name in self.layer_names:
             print(f"Layer: {layer_name}")
@@ -292,21 +352,34 @@ class LocalVisualTCAV(VisualTCAV):
         """
         Visualize concept maps and attribution scores.
 
+        Creates a grid with one row per concept:
+        - Left columns: concept map heatmap overlaid on the original image.
+          Red/yellow areas indicate high concept presence.
+        - Last column: horizontal bar chart of attribution scores per class.
+
         Parameters
         ----------
         colormap : CustomColormap, optional
             Colormap for heatmaps. Defaults to DEFAULT_COLORMAP.
         figsize : tuple, optional
-            Figure size as (width, height).
+            Figure size as (width, height). Auto-computed if not provided.
         save_path : str, optional
-            If provided, saves the figure to disk instead of displaying it.
+            If provided, saves the figure to this path instead of displaying.
 
         Raises
         ------
         RuntimeError
             If explain() has not been called yet.
         """
-        self._check_explained()
+        has_results = any(
+            self.computations[layer][concept].concept_map is not None
+            for layer in self.layer_names
+            for concept in self.concept_names
+        )
+        if not has_results:
+            raise RuntimeError(
+                "No results found. Call explain() before plot()."
+            )
 
         if colormap is None:
             colormap = DEFAULT_COLORMAP
@@ -316,7 +389,9 @@ class LocalVisualTCAV(VisualTCAV):
         n_cols = n_layers + 1
 
         if figsize is None:
-            figsize = (n_cols * 4, n_concepts * 4)
+            # Minimum readable size regardless of number of columns
+            col_width = max(5, 16 // max(n_cols, 1))
+            figsize = (n_cols * col_width, n_concepts * 5)
 
         fig = plt.figure(figsize=figsize)
         fig.suptitle(
@@ -330,11 +405,16 @@ class LocalVisualTCAV(VisualTCAV):
 
         for row_idx, concept_name in enumerate(self.concept_names):
             for col_idx, layer_name in enumerate(self.layer_names):
-                ax = fig.add_subplot(n_concepts, n_cols, row_idx * n_cols + col_idx + 1)
+                ax = fig.add_subplot(
+                    n_concepts, n_cols, row_idx * n_cols + col_idx + 1
+                )
 
-                concept_map = self.computations[layer_name][concept_name].concept_map
+                concept_map = (
+                    self.computations[layer_name][concept_name].concept_map
+                )
 
-                # Bilinear upscaling gives smooth overlay vs blocky nearest-neighbor
+                # Bilinear upscaling gives a smooth overlay
+                # (nearest-neighbor would produce a blocky 7x7 grid)
                 concept_map_upscaled = F.interpolate(
                     concept_map.unsqueeze(0).unsqueeze(0).float(),
                     size=(H, W),
@@ -347,6 +427,7 @@ class LocalVisualTCAV(VisualTCAV):
                 ax.set_title(f"{concept_name}\n{layer_name}", fontsize=9)
                 ax.axis("off")
 
+            # Attribution bar chart (last column)
             ax_bar = fig.add_subplot(
                 n_concepts, n_cols, row_idx * n_cols + n_layers + 1
             )
@@ -358,13 +439,18 @@ class LocalVisualTCAV(VisualTCAV):
                 attribution = self.computations[
                     self.layer_names[-1]
                 ][concept_name].attributions.get(class_index, 0.0)
-                class_labels.append(self.model_wrapper.id_to_label(class_index))
+                class_labels.append(
+                    self.model_wrapper.id_to_label(class_index)
+                )
                 attribution_values.append(float(attribution))
 
-            bars = ax_bar.barh(class_labels, attribution_values, color="steelblue")
+            bars = ax_bar.barh(
+                class_labels, attribution_values, color="steelblue"
+            )
             ax_bar.set_xlabel("Attribution score")
             ax_bar.set_title(f"{concept_name}\nattributions", fontsize=9)
-            ax_bar.set_xlim(left=0)
+            max_val = max(attribution_values) if attribution_values else 1.0
+            ax_bar.set_xlim(left=0, right=max(max_val * 1.2, 0.01))
 
             for bar, val in zip(bars, attribution_values):
                 ax_bar.text(
@@ -382,30 +468,3 @@ class LocalVisualTCAV(VisualTCAV):
             print(f"Plot saved to: {save_path}")
         else:
             plt.show()
-
-    # -----------------------------------------------------------------------
-    # Validation helpers
-    # -----------------------------------------------------------------------
-
-    def _check_test_image(self) -> None:
-        if self.test_image_tensor is None:
-            raise RuntimeError(
-                "No test image set. Call set_test_image() first, "
-                "or pass test_image_path to the constructor."
-            )
-
-    def _check_ready(self) -> None:
-        self._check_test_image()
-        if not self.concept_names:
-            raise RuntimeError("No concepts set. Call set_concepts() first.")
-        if not self.layer_names:
-            raise RuntimeError("No layers set. Call set_layers() first.")
-
-    def _check_explained(self) -> None:
-        has_results = any(
-            self.computations[layer][concept].concept_map is not None
-            for layer in self.layer_names
-            for concept in self.concept_names
-        )
-        if not has_results:
-            raise RuntimeError("No results found. Call explain() before plot().")
