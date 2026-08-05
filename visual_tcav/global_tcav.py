@@ -32,50 +32,40 @@ class GlobalVisualTCAV(VisualTCAV):
 
     **Does this concept consistently influence predictions for this class?**
 
-    The model is provided via one of two standard interfaces:
-
-    **String** — auto-loads the model with default ImageNet weights:
+    Before instantiating, use :func:`~visual_tcav.available_layers` to
+    inspect available layer names:
 
     .. code-block:: python
+
+        from visual_tcav import available_layers, GlobalVisualTCAV
+
+        available_layers("resnet50")
 
         tcav = GlobalVisualTCAV(
             model="resnet50",
             test_images_dir="./images/zebra",
             concept_names=["striped", "dotted"],
             concept_base_dir="./concept_images",
+            random_dir="./concept_images/random",
             layer_names=["layer4"],
         )
         tcav.explain()
         tcav.statsInfo()
         tcav.plot()
 
-    **nn.Module** — use your own model:
-
-    .. code-block:: python
-
-        import torchvision.models as models
-        resnet = models.resnet50(weights='DEFAULT')
-        tcav = GlobalVisualTCAV(
-            model=resnet,
-            model_name="resnet50",
-            ...
-        )
-
     All parameters are optional at construction time. Validation happens
-    when explain() is called, so you can create the object first and
-    inspect available layers with model_wrapper.info() before configuring.
+    at explain() time with clear, actionable error messages.
 
     Parameters
     ----------
     model : str or nn.Module, optional
         Model name string or PyTorch model object.
     model_name : str, optional
-        Display name for the model. For nn.Module of known torchvision
-        models, set this to enable auto-loading of labels.
+        Display name for the model.
     model_wrapper : TorchModelWrapper, optional
         Pre-built wrapper for advanced use cases.
     test_images_dir : str, optional
-        Folder containing test images of ONE class (e.g. 50 zebra photos).
+        Folder containing test images of ONE class.
     concept_names : list of str, optional
         Names of the concepts to analyze.
     concept_base_dir : str, optional
@@ -83,23 +73,22 @@ class GlobalVisualTCAV(VisualTCAV):
     concept_dirs : dict, optional
         Explicit mapping of concept name to image folder.
     random_dir : str, optional
-        Folder containing random images used as reference distribution.
-        Defaults to concept_base_dir/random/ if not provided.
+        Folder containing random images (reference distribution).
     layer_names : list of str, optional
         CNN layers to analyze.
     n_classes : int, optional
-        Number of top predicted classes to explain. Default is 3.
+        Number of top predicted classes. Default is 3.
     m_steps : int, optional
-        Interpolation steps for Integrated Gradients. Default is 50.
+        Interpolation steps for IG. Default is 50.
     max_examples : int, optional
-        Maximum number of concept/random images. Default is 500.
+        Maximum concept/random images. Default is 500.
     max_test_images : int, optional
-        Maximum number of test images to process. Default is 50.
+        Maximum test images to process. Default is 50.
     cache_dir : str, optional
-        Directory for caching results. Default is ".cache".
+        Directory for caching. Default is ".cache".
+        Set to None to disable caching.
     cav_fn : callable, optional
-        Custom CAV computation function. Must accept two tensors of
-        shape [N, C] and return a Cav object.
+        Custom CAV computation function.
     """
 
     def __init__(
@@ -168,7 +157,7 @@ class GlobalVisualTCAV(VisualTCAV):
         FileNotFoundError
             If the folder does not exist.
         ValueError
-            If no valid images are found in the folder.
+            If no valid images are found.
         """
         if not os.path.exists(images_dir):
             raise FileNotFoundError(
@@ -197,18 +186,14 @@ class GlobalVisualTCAV(VisualTCAV):
     # Explanation
     # -----------------------------------------------------------------------
 
-    def explain(
-        self,
-        cache_cav: bool = True,
-        cache_random: bool = True,
-    ) -> None:
+    def explain(self, force_recompute: bool = False) -> None:
         """
         Run the Visual-TCAV pipeline on all test images and compute statistics.
 
         Three-phase pipeline:
 
         **Phase 1** — Compute CAVs once per (layer, concept) pair. CAVs only
-        depend on concept images, not test images, so they are shared
+        depend on concept images, not test images, so they are reused
         across all test images.
 
         **Phase 2** — Process each test image: extract feature maps, compute
@@ -219,17 +204,21 @@ class GlobalVisualTCAV(VisualTCAV):
 
         Parameters
         ----------
-        cache_cav : bool
-            Save/load CAVs from disk. Default is True.
-        cache_random : bool
-            Save/load random activations from disk. Default is True.
+        force_recompute : bool
+            If True, ignores all cached results and recomputes from scratch.
+            If False (default), loads cached CAVs and activations when
+            available to avoid redundant computation.
 
         Raises
         ------
         RuntimeError
             If test images, concepts, or layers have not been configured.
+
+        Examples
+        --------
+        >>> tcav.explain()                     # use cache (default, fast)
+        >>> tcav.explain(force_recompute=True)  # recompute everything fresh
         """
-        # Validate configuration — errors here are informative and actionable
         if not self.test_image_paths:
             raise RuntimeError(
                 "test_images_dir not set. Pass it to the constructor:\n"
@@ -239,14 +228,14 @@ class GlobalVisualTCAV(VisualTCAV):
         if not self.concept_names:
             raise RuntimeError(
                 "concept_names not set. Pass it to the constructor:\n"
-                "  GlobalVisualTCAV(..., concept_names=['striped', 'dotted'], "
+                "  GlobalVisualTCAV(..., concept_names=['striped'], "
                 "concept_base_dir='./concept_images', ...)"
             )
         if not self.layer_names:
             raise RuntimeError(
                 "layer_names not set. Pass it to the constructor:\n"
                 "  GlobalVisualTCAV(..., layer_names=['layer4'], ...)\n"
-                "Call model_wrapper.info() to see available layer names."
+                "Use available_layers(model) to see valid layer names."
             )
 
         print(f"\nRunning GlobalVisualTCAV explanation...")
@@ -265,20 +254,20 @@ class GlobalVisualTCAV(VisualTCAV):
             for layer in self.layer_names
         }
 
-        # Phase 1: compute CAVs once — shared across all test images
+        # Phase 1: compute CAVs once — reused across all test images
         print("Phase 1: Computing CAVs...")
         cavs = {}
         for layer_name in self.layer_names:
             cavs[layer_name] = {}
             random_activations = self._compute_random_activations(
-                layer_name, use_cache=cache_random
+                layer_name, force_recompute=force_recompute
             )
             for concept_name in self.concept_names:
                 cav = self._compute_cavs(
                     layer_name=layer_name,
                     concept_name=concept_name,
                     random_activations=random_activations,
-                    use_cache=cache_cav,
+                    force_recompute=force_recompute,
                 )
                 cavs[layer_name][concept_name] = cav
                 self.computations[layer_name][concept_name].cav = cav
@@ -290,7 +279,6 @@ class GlobalVisualTCAV(VisualTCAV):
             predictions = super().predict(image_tensor, img_path)
             target_classes = [p.class_index for p in predictions.predictions[0]]
 
-            # Store target classes from first image for display in statsInfo()
             if not self.target_classes:
                 self.target_classes = target_classes
 
@@ -316,7 +304,7 @@ class GlobalVisualTCAV(VisualTCAV):
                             attribution.item()
                         )
 
-        # Phase 3: compute statistics from collected scores
+        # Phase 3: compute statistics
         print("\nPhase 3: Computing statistics...")
         self.stats = {}
         for layer_name in self.layer_names:
@@ -336,12 +324,7 @@ class GlobalVisualTCAV(VisualTCAV):
 
     def statsInfo(self) -> None:
         """
-        Print a table summarizing attribution statistics across all test images.
-
-        For each (concept, layer, class) combination shows:
-        - Mean attribution score
-        - Standard deviation
-        - 95% confidence interval
+        Print attribution statistics across all test images.
 
         Raises
         ------
@@ -376,9 +359,7 @@ class GlobalVisualTCAV(VisualTCAV):
                     )
 
                     table.add_row([
-                        concept_name,
-                        layer_name,
-                        class_name,
+                        concept_name, layer_name, class_name,
                         f"{stat.mean.item():.4f}",
                         f"{stat.std.item():.4f}",
                         f"[{stat.begin.item():.4f}, {stat.end.item():.4f}]",
@@ -386,23 +367,16 @@ class GlobalVisualTCAV(VisualTCAV):
 
         print(table)
 
-    def plot(
-        self,
-        figsize: tuple = None,
-        save_path: str = None,
-    ) -> None:
+    def plot(self, figsize: tuple = None, save_path: str = None) -> None:
         """
         Visualize global attribution statistics as grouped bar charts.
-
-        One subplot per layer. Each group on the x-axis is a predicted class;
-        each bar in the group is a concept. Error bars show the 95% CI.
 
         Parameters
         ----------
         figsize : tuple, optional
             Figure size as (width, height). Auto-computed if not provided.
         save_path : str, optional
-            If provided, saves the figure to disk instead of displaying.
+            If provided, saves the figure to disk.
 
         Raises
         ------
@@ -426,8 +400,7 @@ class GlobalVisualTCAV(VisualTCAV):
 
         fig.suptitle(
             f"GlobalVisualTCAV — {self.model_wrapper.model_name}",
-            fontsize=14,
-            fontweight="bold",
+            fontsize=14, fontweight="bold",
         )
 
         colors = plt.cm.tab10(np.linspace(0, 1, n_concepts))
@@ -451,20 +424,14 @@ class GlobalVisualTCAV(VisualTCAV):
 
                 offset = (concept_idx - n_concepts / 2) * bar_width + bar_width / 2
                 ax.bar(
-                    x + offset,
-                    means,
-                    bar_width,
-                    label=concept_name,
-                    color=colors[concept_idx],
-                    yerr=errors,
-                    capsize=4,
-                    error_kw={"elinewidth": 1.5},
+                    x + offset, means, bar_width,
+                    label=concept_name, color=colors[concept_idx],
+                    yerr=errors, capsize=4, error_kw={"elinewidth": 1.5},
                 )
 
             class_labels = [
                 self.model_wrapper.id_to_label(self.target_classes[r])
-                if r < len(self.target_classes)
-                else f"class_{r}"
+                if r < len(self.target_classes) else f"class_{r}"
                 for r in range(self.n_classes)
             ]
 
@@ -489,19 +456,7 @@ class GlobalVisualTCAV(VisualTCAV):
     # -----------------------------------------------------------------------
 
     def _load_image(self, image_path: str) -> torch.Tensor:
-        """
-        Load and preprocess a single image from disk.
-
-        Parameters
-        ----------
-        image_path : str
-            Path to the image file.
-
-        Returns
-        -------
-        torch.Tensor
-            Preprocessed tensor. Shape: [1, C, H, W].
-        """
+        """Load and preprocess a single image. Returns [1, C, H, W] tensor."""
         from PIL import Image
         from torchvision import transforms
 

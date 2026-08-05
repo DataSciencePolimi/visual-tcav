@@ -9,6 +9,7 @@ Both LocalVisualTCAV and GlobalVisualTCAV inherit from this class.
 
 import os
 import sys
+import shutil
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,21 +38,28 @@ _SUPPORTED_MODELS = {
 }
 
 
-def available_layers(model) -> None:
+def available_layers(model, model_name: str = None) -> None:
     """
     Print the available CNN layers for a model.
 
     Use this utility function before instantiating LocalVisualTCAV or
-    GlobalVisualTCAV to decide which layers to analyze.
+    GlobalVisualTCAV to decide which layers to analyze. Deeper layers
+    (closer to the output) capture higher-level concepts.
 
     Parameters
     ----------
     model : str or nn.Module
         Model name string (e.g. "resnet50") or a PyTorch model object.
+    model_name : str, optional
+        Display name for the model. Required when passing an nn.Module
+        of a known torchvision model to enable label auto-loading
+        (e.g. model_name="resnet50").
 
     Examples
     --------
     >>> from visual_tcav import available_layers
+    >>>
+    >>> # From a model name string
     >>> available_layers("resnet50")
     +----------------------------+
     |       Model: resnet50      |
@@ -63,13 +71,45 @@ def available_layers(model) -> None:
     |            |    layer3     |
     |            |    layer4     |
     +------------+---------------+
-
+    >>>
+    >>> # From an nn.Module
     >>> import torchvision.models as models
     >>> my_resnet = models.resnet50(weights='DEFAULT')
-    >>> available_layers(my_resnet)
+    >>> available_layers(my_resnet, model_name="resnet50")
     """
-    wrapper = _build_wrapper(model, model_name=None)
-    wrapper.info()
+    from prettytable import PrettyTable
+
+    if isinstance(model, str):
+        # String path — full wrapper with labels available
+        wrapper = _build_wrapper(model, model_name=model_name)
+        wrapper.info()
+        return
+
+    if isinstance(model, nn.Module):
+        # Try full wrapper first (labels available for known models)
+        try:
+            wrapper = _build_wrapper(model, model_name=model_name)
+            wrapper.info()
+        except ValueError:
+            # Unknown model — show layer names only, no labels needed
+            name = model_name or model.__class__.__name__
+            layer_names = [
+                n for n, m in model.named_children()
+                if not isinstance(m, (nn.Linear, nn.Flatten))
+                and n not in ("avgpool", "fc", "classifier")
+            ]
+            table = PrettyTable(
+                title=f"Model: {name}",
+                field_names=["Layers"],
+            )
+            for layer in layer_names:
+                table.add_row([layer])
+            print(table)
+        return
+
+    raise ValueError(
+        "model must be a string (e.g. 'resnet50') or a PyTorch nn.Module."
+    )
 
 
 def _build_wrapper(model, model_name):
@@ -160,13 +200,12 @@ class VisualTCAV:
     Implements the core pipeline shared by LocalVisualTCAV and GlobalVisualTCAV.
     Not meant to be used directly — use LocalVisualTCAV or GlobalVisualTCAV.
 
-    Before instantiating, use the standalone utility function to inspect
-    available layers:
+    Before instantiating, use the standalone utility to inspect available layers:
 
     .. code-block:: python
 
         from visual_tcav import available_layers
-        available_layers("resnet50")   # prints layer names
+        available_layers("resnet50")
 
     The model is provided via one of two standard interfaces:
 
@@ -181,16 +220,7 @@ class VisualTCAV:
     .. code-block:: python
 
         my_model = models.resnet50(weights=ResNet50_Weights.DEFAULT)
-        tcav = LocalVisualTCAV(model=my_model, ...)
-
-    For advanced use cases (custom labels, custom preprocessing), use
-    :class:`~visual_tcav.model_wrapper.TorchModelWrapper` directly:
-
-    .. code-block:: python
-
-        wrapper = TorchModelWrapper(model_name="my_cnn", model=my_model,
-                                    labels=my_labels, model_preprocess=my_fn)
-        tcav = LocalVisualTCAV(model_wrapper=wrapper, ...)
+        tcav = LocalVisualTCAV(model=my_model, model_name="resnet50", ...)
 
     Parameters
     ----------
@@ -208,9 +238,11 @@ class VisualTCAV:
         Maximum number of concept/random images to use. Default is 500.
     cache_dir : str, optional
         Directory for caching CAVs and activations. Default is ".cache".
+        Set to None to disable caching entirely.
     cav_fn : callable, optional
         Custom CAV computation function. Must accept two tensors of
-        shape [N, C] and return a Cav object.
+        shape [N, C] and return a Cav object. If not provided, the
+        default centroid difference method is used.
     """
 
     def __init__(
@@ -253,7 +285,38 @@ class VisualTCAV:
         # Use provided CAV function or fall back to centroid difference default
         self.cav_fn = cav_fn if cav_fn is not None else self._default_cav_fn
 
-        os.makedirs(self.cache_dir, exist_ok=True)
+        if self.cache_dir is not None:
+            os.makedirs(self.cache_dir, exist_ok=True)
+
+    # -----------------------------------------------------------------------
+    # Cache management
+    # -----------------------------------------------------------------------
+
+    def clear_cache(self) -> None:
+        """
+        Delete all cached CAVs and random activations.
+
+        Cached files are stored in ``cache_dir`` and named after the model,
+        layer, and concept. Use this method to force full recomputation on
+        the next call to explain(), or to free disk space.
+
+        Uses ``shutil.rmtree`` to remove the cache directory and recreates
+        it empty.
+
+        Examples
+        --------
+        >>> tcav.clear_cache()
+        Cache cleared: .cache
+        """
+        if self.cache_dir is None:
+            print("Caching is disabled (cache_dir=None). Nothing to clear.")
+            return
+        if os.path.exists(self.cache_dir):
+            shutil.rmtree(self.cache_dir)
+            os.makedirs(self.cache_dir, exist_ok=True)
+            print(f"Cache cleared: {self.cache_dir}")
+        else:
+            print(f"Cache directory does not exist: {self.cache_dir}")
 
     # -----------------------------------------------------------------------
     # Internal setup — called by subclass constructors only
@@ -279,7 +342,7 @@ class VisualTCAV:
         concept_base_dir : str, optional
             Base folder containing one subfolder per concept.
         random_dir : str, optional
-            Folder containing random images used as reference distribution.
+            Folder containing random images (reference distribution).
 
         Raises
         ------
@@ -311,7 +374,6 @@ class VisualTCAV:
         if random_dir is not None:
             self.random_dir = random_dir
         elif concept_base_dir is not None:
-            # Convention: random images live in a subfolder named "random"
             self.random_dir = os.path.join(concept_base_dir, "random")
 
         if self.random_dir and not os.path.exists(self.random_dir):
@@ -354,7 +416,7 @@ class VisualTCAV:
     # -----------------------------------------------------------------------
 
     def _compute_random_activations(
-        self, layer_name: str, use_cache: bool = True
+        self, layer_name: str, force_recompute: bool = False
     ) -> torch.Tensor:
         """
         Compute (or load) pooled activations of random images at a layer.
@@ -367,27 +429,30 @@ class VisualTCAV:
         ----------
         layer_name : str
             Layer to extract activations from.
-        use_cache : bool
-            Save/load results from disk. Default is True.
+        force_recompute : bool
+            If True, ignores existing cache and recomputes. Default is False.
 
         Returns
         -------
         torch.Tensor
             Pooled activations of shape [N, C].
         """
-        cache_path = os.path.join(
-            self.cache_dir,
-            f"random_{self.model_wrapper.model_name}_{layer_name}.joblib"
+        cache_path = (
+            os.path.join(
+                self.cache_dir,
+                f"random_{self.model_wrapper.model_name}_{layer_name}.joblib"
+            )
+            if self.cache_dir is not None else None
         )
 
-        if use_cache and os.path.exists(cache_path):
+        if cache_path and not force_recompute and os.path.exists(cache_path):
             print(f"  Loading random activations from cache.")
             return load(cache_path)
 
         if self.random_dir is None:
             raise ValueError(
                 "random_dir not set. Pass it to the constructor:\n"
-                "  LocalVisualTCAV(..., random_dir='./path/to/random/images', ...)"
+                "  LocalVisualTCAV(..., random_dir='./path/to/random/', ...)"
             )
 
         print(f"  Computing random activations at '{layer_name}'...")
@@ -400,7 +465,7 @@ class VisualTCAV:
         pooled = F.adaptive_avg_pool2d(feature_maps, (1, 1))
         pooled = pooled.squeeze(-1).squeeze(-1)
 
-        if use_cache:
+        if cache_path:
             dump(pooled, cache_path)
 
         return pooled
@@ -453,7 +518,7 @@ class VisualTCAV:
         layer_name: str,
         concept_name: str,
         random_activations: torch.Tensor,
-        use_cache: bool = True,
+        force_recompute: bool = False,
     ) -> Cav:
         """
         Compute (or load) the CAV for a concept at a specific layer.
@@ -469,20 +534,23 @@ class VisualTCAV:
             Name of the concept (e.g. "striped").
         random_activations : torch.Tensor
             Pre-computed pooled activations of random images. Shape: [N, C].
-        use_cache : bool
-            Save/load the CAV from disk. Default is True.
+        force_recompute : bool
+            If True, ignores existing cache and recomputes. Default is False.
 
         Returns
         -------
         Cav
             The computed CAV.
         """
-        cache_path = os.path.join(
-            self.cache_dir,
-            f"cav_{self.model_wrapper.model_name}_{layer_name}_{concept_name}.joblib"
+        cache_path = (
+            os.path.join(
+                self.cache_dir,
+                f"cav_{self.model_wrapper.model_name}_{layer_name}_{concept_name}.joblib"
+            )
+            if self.cache_dir is not None else None
         )
 
-        if use_cache and os.path.exists(cache_path):
+        if cache_path and not force_recompute and os.path.exists(cache_path):
             print(f"  Loading CAV from cache: {concept_name} @ {layer_name}")
             cav = load(cache_path)
             return cav.to(self.device)
@@ -500,7 +568,7 @@ class VisualTCAV:
         # Delegate to cav_fn — default centroid method or user-provided function
         cav = self.cav_fn(pooled_concepts, random_activations)
 
-        if use_cache:
+        if cache_path:
             dump(cav.cpu(), cache_path)
 
         return cav.to(self.device)

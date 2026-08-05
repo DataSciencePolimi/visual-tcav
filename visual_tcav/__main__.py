@@ -239,7 +239,7 @@ def local(model, image, concepts, concept_dir, random_dir, layers,
     )
 
     tcav.predict().info()
-    tcav.explain(cache_cav=use_cache, cache_random=use_cache)
+    tcav.explain(force_recompute=not use_cache)
     tcav.plot(save_path=save_path)
 
     click.echo(f"\nDone. Figure saved to: {save_path}")
@@ -382,7 +382,7 @@ def global_cmd(model, images_dir, concepts, concept_dir, random_dir, layers,
         cache_dir=cache_dir,
     )
 
-    tcav.explain(cache_cav=use_cache, cache_random=use_cache)
+    tcav.explain(force_recompute=not use_cache)
     tcav.statsInfo()
     tcav.plot(save_path=plot_path)
 
