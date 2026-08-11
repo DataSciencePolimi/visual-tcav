@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "visual-tcav"
-version = "0.1.0"
+version = "0.1.1"
 description = "Visual-TCAV: Concept-based Attribution and Saliency Maps for Explainable AI in PyTorch"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -46,8 +46,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# CLIP is not available on PyPI — install it manually before using TextToConcept:
+#   pip install git+https://github.com/openai/CLIP.git
 text-to-concept = [
-    "clip @ git+https://github.com/openai/CLIP.git",
     "scipy>=1.10.0",
 ]
 dev = [
