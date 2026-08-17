@@ -26,3 +26,7 @@ Thumbs.db
 
 # VS Code
 .vscode/
+
+# Distribution zip — sent to supervisors for review, not needed in repo
+visual_tcav_package.zip
+*.zip
