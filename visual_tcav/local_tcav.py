@@ -17,8 +17,8 @@ from torchvision import transforms
 from PIL import Image
 import matplotlib.pyplot as plt
 
-from visual_tcav.visual_tcav import VisualTCAV
-from visual_tcav.utils import DEFAULT_COLORMAP
+from .visual_tcav import VisualTCAV
+from .utils import DEFAULT_COLORMAP
 
 sys.dont_write_bytecode = True
 

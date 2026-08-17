@@ -25,8 +25,8 @@ import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-from visual_tcav.linear_aligner import LinearAligner
-from visual_tcav.utils import Cav
+from .linear_aligner import LinearAligner
+from .utils import Cav
 
 sys.dont_write_bytecode = True
 

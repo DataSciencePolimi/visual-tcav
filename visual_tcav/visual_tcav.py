@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from joblib import dump, load
 from typing import Callable, Optional
 
-from visual_tcav.utils import (
+from .utils import (
     Cav,
     ConceptLayer,
     Prediction,
@@ -129,7 +129,7 @@ def _build_wrapper(model, model_name):
         Ready-to-use wrapper with labels and preprocessing resolved.
     """
     import torchvision.models as tv
-    from visual_tcav.model_wrapper import TorchModelWrapper
+    from .model_wrapper import TorchModelWrapper
 
     if isinstance(model, str):
         name = model.lower()

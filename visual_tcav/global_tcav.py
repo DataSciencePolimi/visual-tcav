@@ -15,8 +15,8 @@ import torch
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from visual_tcav.visual_tcav import VisualTCAV
-from visual_tcav.utils import Stat
+from .visual_tcav import VisualTCAV
+from .utils import Stat
 
 sys.dont_write_bytecode = True
 
