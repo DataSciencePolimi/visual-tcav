@@ -69,12 +69,12 @@ available_layers("resnet50")
 # Step 2 — instantiate with full configuration
 tcav = LocalVisualTCAV(
     model="resnet50",
-    test_image_path="./data/zebra.jpg",
+    test_image_path="./examples/data/test_images/zebra.jpg",
     concept_names=["striped", "dotted"],
-    concept_base_dir="./data/concept_images",
-    random_dir="./data/concept_images/random",
+    concept_base_dir="./examples/data/concept_images",
+    random_dir="./examples/data/concept_images/random",
     layer_names=["layer4"],
-    cache_dir="./data/.cache",
+    cache_dir="./.cache",
 )
 
 # Step 3 — explain and visualize
