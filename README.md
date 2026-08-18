@@ -35,6 +35,13 @@ cd visual-tcav
 pip install -e .
 ```
 
+**Without installation**:
+```bash
+git clone https://github.com/saracavallini01/visual-tcav.git
+cd visual-tcav
+pip install -r requirements.txt
+```
+
 **Text-to-Concept extension** (requires CLIP):
 ```bash
 pip install visual-tcav[text-to-concept]
