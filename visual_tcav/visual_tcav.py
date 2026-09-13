@@ -600,7 +600,7 @@ class VisualTCAV:
         torch.Tensor
             Interpolated feature maps. Shape: [m_steps, C, H, W].
         """
-        alphas = torch.linspace(0, 1, self.m_steps).view(self.m_steps, 1, 1, 1)
+        alphas = torch.linspace(0, 1, self.m_steps, device=feature_maps.device).view(self.m_steps, 1, 1, 1)
         delta = feature_maps - baseline
         return baseline + alphas * delta
 

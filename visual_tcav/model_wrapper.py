@@ -425,8 +425,9 @@ class TorchModelWrapper:
         for batch_imgs, _ in self._get_images_for_concept(concept_path):
             batch_imgs = batch_imgs.to(self.device)
             fmaps = self.get_feature_maps(batch_imgs, layer_name)
-            all_feature_maps.append(fmaps.detach().cpu())
-        return torch.cat(all_feature_maps, dim=0)
+            # Keep on GPU during accumulation — move to CPU once at the end
+            all_feature_maps.append(fmaps.detach())
+        return torch.cat(all_feature_maps, dim=0).cpu()
 
     # -----------------------------------------------------------------------
     # Logits
@@ -495,9 +496,10 @@ class TorchModelWrapper:
             logits = self.get_logits(inputs, layer_name)
             score = logits[:, target_class_index].sum()
             score.backward()
-            gradients.append(inputs.grad.detach().cpu())
+            # Keep on GPU during accumulation — move to CPU once at the end
+            gradients.append(inputs.grad.detach())
 
-        return torch.cat(gradients, dim=0)
+        return torch.cat(gradients, dim=0).cpu()
 
     # -----------------------------------------------------------------------
     # Image loading

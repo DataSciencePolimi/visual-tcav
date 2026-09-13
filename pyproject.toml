@@ -12,14 +12,8 @@ authors = [
     { name = "Sara Cavallini", email = "saracavallini01@gmail.com" }
 ]
 keywords = [
-    "explainable-ai",
-    "xai",
-    "tcav",
-    "concept-attribution",
-    "pytorch",
-    "cnn",
-    "interpretability",
-    "saliency-maps",
+    "explainable-ai", "xai", "tcav", "concept-attribution",
+    "pytorch", "cnn", "interpretability", "saliency-maps",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -46,7 +40,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# CLIP is not available on PyPI — install it manually before using TextToConcept:
+# CLIP is not on PyPI — install manually before using TextToConcept:
 #   pip install git+https://github.com/openai/CLIP.git
 text-to-concept = [
     "scipy>=1.10.0",
@@ -54,8 +48,6 @@ text-to-concept = [
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
-    "flake8>=6.0.0",
-    "mypy>=1.0.0",
 ]
 
 [project.urls]
@@ -72,3 +64,35 @@ include = ["visual_tcav*"]
 
 [tool.setuptools.package-data]
 visual_tcav = ["py.typed"]
+
+# ---------------------------------------------------------------------------
+# pytest — 2025 standard: config inside pyproject.toml, no pytest.ini needed
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -v --tb=short"
+markers = [
+    "slow: marks tests that take more than a few seconds (skip with -m 'not slow')",
+    "gpu:  marks tests that require a GPU (skip with -m 'not gpu')",
+]
+minversion = "7.0"
+
+# ---------------------------------------------------------------------------
+# coverage
+# ---------------------------------------------------------------------------
+[tool.coverage.run]
+source = ["visual_tcav"]
+omit = [
+    # CLI tested separately via CliRunner
+    "visual_tcav/__main__.py",
+    # Text-to-Concept extension requires CLIP (not on PyPI) and a
+    # trained Linear Aligner file — cannot be tested without optional deps
+    "visual_tcav/linear_aligner.py",
+    "visual_tcav/text_to_concept.py",
+    "tests/*",
+]
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true
+skip_covered = false

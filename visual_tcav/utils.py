@@ -23,9 +23,6 @@ def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
     """
     Compute the cosine similarity between two vectors.
 
-    Returns 1.0 if identical direction, 0.0 if perpendicular,
-    -1.0 if opposite.
-
     Parameters
     ----------
     vec1 : np.ndarray
@@ -98,21 +95,16 @@ class Cav:
     """
     Stores all data related to a Concept Activation Vector (CAV).
 
-    A CAV represents a concept (e.g. 'stripes') as a direction in the
-    internal space of a CNN layer, computed as the difference between
-    the mean activation of concept images and random images.
-
     Attributes
     ----------
     concept_centroid : torch.Tensor or None
         Mean activation vector of concept images.
     negative_centroid : torch.Tensor or None
-        Mean activation vector of random (negative) images.
+        Mean activation vector of random images.
     direction : torch.Tensor or None
-        CAV direction = concept_centroid - negative_centroid.
+        CAV direction = concept_centroid - random_centroid.
     concept_emblem : torch.Tensor or None
-        Scale factor used to normalize concept maps, derived from
-        concept activations via contraharmonic mean.
+        Scale factor used to normalize concept maps.
     """
 
     def __init__(
@@ -301,8 +293,11 @@ class Stat:
     Stores attribution statistics for the Global Explainer.
 
     Computes mean, standard deviation, and a 95.45% confidence interval
-    (mean ± 2 * standard error) across a list of attribution scores.
+    (mean +/- 2 * standard error) across a list of attribution scores.
     The lower bound is clipped to 0 since attributions are non-negative.
+
+    Uses torch primitives throughout to avoid unnecessary numpy conversions,
+    which would force data transfers between GPU and CPU on GPU machines.
 
     Attributes
     ----------
@@ -324,8 +319,10 @@ class Stat:
 
     def __init__(self, attributions: list):
         self.attributions = attributions
-        self.mean = torch.mean(torch.tensor(attributions, dtype=torch.float32))
-        self.std = torch.tensor(np.std(attributions, ddof=1), dtype=torch.float32)
+        t = torch.tensor(attributions, dtype=torch.float32)
+        self.mean = torch.mean(t)
+        # ddof=1 for unbiased standard deviation estimate
+        self.std = torch.std(t, correction=1)
         self.n = len(attributions)
         self.std_err = self.std / torch.sqrt(torch.tensor(self.n, dtype=torch.float32))
         # ReLU clips the lower bound to 0 — attributions cannot be negative
@@ -340,10 +337,6 @@ class Stat:
 class CustomColormap:
     """
     Custom colormap for visualizing concept maps as heatmaps.
-
-    Low-activation areas are rendered black (transparent overlay),
-    high-activation areas use the jet colormap (blue to red), making
-    it easy to overlay heatmaps on the original image.
 
     Parameters
     ----------
@@ -408,20 +401,17 @@ class CustomColormap:
         plt.clim(self.min, self.max)
 
     def get_min(self) -> float:
-        """Return the minimum colormap value."""
         return self.min
 
     def get_max(self) -> float:
-        """Return the maximum colormap value."""
         return self.max
 
     def get_alpha(self) -> float:
-        """Return the colormap alpha (transparency)."""
         return self.alpha
 
 
 # ---------------------------------------------------------------------------
-# Default colormap instance used across the package
+# Default colormap instance
 # ---------------------------------------------------------------------------
 
 _original_colormap = cm.jet
