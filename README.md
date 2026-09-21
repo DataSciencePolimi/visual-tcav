@@ -226,15 +226,21 @@ covering all features with increasing complexity.
 
 ---
 
+## Acknowledgments
+
+The current software architecture, package refactoring, documentation, command-line interface, and distribution were developed as part of:
+> Cavallini, S., *Refactoring of Visual-TCAV*, Master's Thesis, Politecnico di Milano, 2026.
+
+---
+
 ## Citation
 
 If you use this package in your research, please cite:
 
 ```bibtex
-@article{
-    santis2026visualtcav,
+@article{visualtcav2026,
     title={Visual-{TCAV}: Concept-based Attribution and Saliency Maps for Post-hoc Explainability in Image Classification},
-    author={Antonio De Santis and Riccardo Campi and Matteo Bianchi and Marco Brambilla},
+    author={Antonio {De Santis} and Riccardo Campi and Matteo Bianchi and Marco Brambilla},
     journal={Transactions on Machine Learning Research},
     issn={2835-8856},
     year={2026},
