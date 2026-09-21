@@ -12,7 +12,8 @@ Given a test image and a human-understandable concept (e.g. *"stripes"*), **visu
 - An **attribution score** — measuring *how much* the concept influenced the model's prediction
 
 Based on:
-> De Santis et al., *Visual-TCAV: Concept-based Attribution and Saliency Maps for Post-hoc Explainability in Image Classification*, 2025. [arXiv:2411.05698](https://arxiv.org/abs/2411.05698)
+<!-- > De Santis et al., *Visual-TCAV: Concept-based Attribution and Saliency Maps for Post-hoc Explainability in Image Classification*, 2025. [arXiv:2411.05698](https://arxiv.org/abs/2411.05698) -->
+> De Santis et al., *Visual-TCAV: Concept-based Attribution and Saliency Maps for Post-hoc Explainability in Image Classification*, **Transactions on Machine Learning Research (TMLR), 2025**. [OpenReview](https://openreview.net/forum?id=SLh00W5rhu)
 
 ---
 
