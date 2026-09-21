@@ -12,8 +12,7 @@ authors = [
     { name = "Antonio De Santis", email = "antonio.desantis@polimi.it" },
     { name = "Riccardo Campi", email = "riccardo.campi@polimi.it" },
     { name = "Matteo Bianchi", email = "matteo.bianchi@polimi.it" },
-    { name = "Marco Brambilla", email = "marco.brambilla@polimi.it" },
-    { name = "Sara Cavallini", email = "saracavallini01@gmail.com" }
+    { name = "Marco Brambilla", email = "marco.brambilla@polimi.it" }
 ]
 keywords = [
     "explainable-ai", "xai", "tcav", "concept-attribution",
