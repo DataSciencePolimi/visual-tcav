@@ -9,7 +9,10 @@ description = "Visual-TCAV: Concept-based Attribution and Saliency Maps for Post
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [
+    { name = "Antonio De Santis", email = "antonio.desantis@polimi.it" },
     { name = "Riccardo Campi", email = "riccardo.campi@polimi.it" },
+    { name = "Matteo Bianchi", email = "matteo.bianchi@polimi.it" },
+    { name = "Marco Brambilla", email = "marco.brambilla@polimi.it" },
     { name = "Sara Cavallini", email = "saracavallini01@gmail.com" }
 ]
 keywords = [
