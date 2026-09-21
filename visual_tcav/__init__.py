@@ -2,7 +2,7 @@
 visual_tcav
 -----------
 Visual-TCAV: Concept-based Attribution and Saliency Maps for
-Explainable AI in PyTorch.
+Post-hoc Explainability in Image Classification.
 
 Given an image and a human concept (e.g. "stripes"), Visual-TCAV produces:
 - A concept map: a heatmap showing WHERE the CNN detected that concept
@@ -29,11 +29,11 @@ Quick start
 >>> tcav.plot()
 
 Based on:
-    De Santis et al., "Visual-TCAV: Concept-based Attribution and Saliency
-    Maps for Post-hoc Explainability in Image Classification", 2025.
-    https://arxiv.org/abs/2411.05698
+- De Santis et al., "Visual-TCAV: Concept-based Attribution and Saliency
+    Maps for Post-hoc Explainability in Image Classification", TMLR 2026.
+    https://openreview.net/forum?id=SLh00W5rhu
 
-Text-to-Concept extension by Daniele Di Santi (2025), based on:
+- Text-to-Concept extension by Daniele Di Santi (2025), based on:
     Moayeri et al., "Text-To-Concept (and Back) via Cross-Model Alignment",
     arXiv:2305.06386, 2023.
 """
