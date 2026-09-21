@@ -229,7 +229,7 @@ covering all features with increasing complexity.
 ## Acknowledgments
 
 The current software architecture, package refactoring, documentation, command-line interface, and distribution were developed as part of:
-> Cavallini, S., *Refactoring of Visual-TCAV*, Master's Thesis, Politecnico di Milano, 2026.
+> Cavallini, S., *Visual-TCAV: Concept-based Attribution and Saliency Maps for Explainable AI in PyTorch*, Master's Thesis, Politecnico di Milano, 2026.
 
 ---
 
