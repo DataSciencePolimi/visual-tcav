@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "visual-tcav"
 version = "0.1.1"
-description = "Visual-TCAV: Concept-based Attribution and Saliency Maps for Explainable AI in PyTorch"
+description = "Visual-TCAV: Concept-based Attribution and Saliency Maps for Post-hoc Explainability in Image Classification"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [
-    { name = "Antonio De Santis", email = "antonio.desantis@polimi.it" }
-    { name = "Riccardo Campi", email = "riccardo.campi@polimi.it" }
-    { name = "Matteo Bianchi", email = "matteo.bianchi@polimi.it" }
-    { name = "Marco Brambilla", email = "marco.brambilla@polimi.it" }
+    { name = "Antonio De Santis", email = "antonio.desantis@polimi.it" },
+    { name = "Riccardo Campi", email = "riccardo.campi@polimi.it" },
+    { name = "Matteo Bianchi", email = "matteo.bianchi@polimi.it" },
+    { name = "Marco Brambilla", email = "marco.brambilla@polimi.it" },
     { name = "Sara Cavallini", email = "saracavallini01@gmail.com" }
 ]
 keywords = [
@@ -55,9 +55,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/saracavallini01/visual-tcav"
-Repository = "https://github.com/saracavallini01/visual-tcav"
-"Bug Tracker" = "https://github.com/saracavallini01/visual-tcav/issues"
+Homepage = "https://github.com/DataSciencePolimi/Visual-TCAV"
+Repository = "https://github.com/DataSciencePolimi/Visual-TCAV"
+"Bug Tracker" = "https://github.com/DataSciencePolimi/Visual-TCAV/issues"
 
 [project.scripts]
 visual-tcav = "visual_tcav.__main__:main"
