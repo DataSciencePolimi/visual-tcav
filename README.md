@@ -231,12 +231,15 @@ covering all features with increasing complexity.
 If you use this package in your research, please cite:
 
 ```bibtex
-@article{desantis2025visualtcav,
-  title   = {Visual-TCAV: Concept-based Attribution and Saliency Maps
-             for Post-hoc Explainability in Image Classification},
-  author  = {De Santis, Gabriele and Bianchi, Matteo and Brambilla, Marco},
-  journal = {arXiv preprint arXiv:2411.05698},
-  year    = {2025}
+@article{
+    santis2026visualtcav,
+    title={Visual-{TCAV}: Concept-based Attribution and Saliency Maps for Post-hoc Explainability in Image Classification},
+    author={Antonio De Santis and Riccardo Campi and Matteo Bianchi and Marco Brambilla},
+    journal={Transactions on Machine Learning Research},
+    issn={2835-8856},
+    year={2026},
+    url={https://openreview.net/forum?id=SLh00W5rhu},
+    note={}
 }
 ```
 
