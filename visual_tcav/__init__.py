@@ -29,11 +29,12 @@ Quick start
 >>> tcav.plot()
 
 Based on:
-- De Santis et al., "Visual-TCAV: Concept-based Attribution and Saliency
+
+De Santis et al., "Visual-TCAV: Concept-based Attribution and Saliency
     Maps for Post-hoc Explainability in Image Classification", TMLR 2026.
     https://openreview.net/forum?id=SLh00W5rhu
 
-- Text-to-Concept extension by Daniele Di Santi (2025), based on:
+Text-to-Concept extension by Daniele Di Santi (2025), based on:
     Moayeri et al., "Text-To-Concept (and Back) via Cross-Model Alignment",
     arXiv:2305.06386, 2023.
 """
