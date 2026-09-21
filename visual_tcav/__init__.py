@@ -66,9 +66,14 @@ from visual_tcav.model_wrapper import TorchModelWrapper
 
 # Package metadata
 __version__ = "0.1.0"
-__author__ = "Sara Cavallini"
-__email__ = "saracavallini01@gmail.com"
 __license__ = "MIT"
+
+__authors__ = [
+    ("Antonio De Santis", "antonio.desantis@polimi.it"),
+    ("Riccardo Campi", "riccardo.campi@polimi.it"),
+    ("Matteo Bianchi", "matteo.bianchi@polimi.it"),
+    ("Marco Brambilla", "marco.brambilla@polimi.it"),
+]
 
 __all__ = [
     # Main classes
