@@ -31,14 +31,14 @@ conda install -c conda-forge visual-tcav
 
 **From source**:
 ```bash
-git clone https://github.com/saracavallini01/visual-tcav.git
+git clone https://github.com/DataSciencePolimi/Visual-TCAV.git
 cd visual-tcav
 pip install -e .
 ```
 
 **Without installation**:
 ```bash
-git clone https://github.com/saracavallini01/visual-tcav.git
+git clone https://github.com/DataSciencePolimi/Visual-TCAV.git
 cd visual-tcav
 pip install -r requirements.txt
 ```
