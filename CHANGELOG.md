@@ -4,9 +4,16 @@ All notable changes to visual-tcav will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.0.0] - 2026-09-20
 
-## [0.1.0] - 2026-07-12
+### Added
+- Public release of the Visual-TCAV source code on GitHub.
+- Documentation and examples for external users.
+
+### Changed
+- Updated project metadata and authorship information.
+
+## [Unreleased] - 2026-07-12
 
 ### Added
 - `LocalVisualTCAV`: explains a single image using Visual-TCAV
