@@ -55,9 +55,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/DataSciencePolimi/Visual-TCAV"
-Repository = "https://github.com/DataSciencePolimi/Visual-TCAV"
-"Bug Tracker" = "https://github.com/DataSciencePolimi/Visual-TCAV/issues"
+Homepage = "https://github.com/DataSciencePolimi/visual-tcav"
+Repository = "https://github.com/DataSciencePolimi/visual-tcav"
+"Bug Tracker" = "https://github.com/DataSciencePolimi/visual-tcav/issues"
 
 [project.scripts]
 visual-tcav = "visual_tcav.__main__:main"
