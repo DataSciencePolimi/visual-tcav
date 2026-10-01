@@ -84,6 +84,11 @@ class GlobalVisualTCAV(VisualTCAV):
         Maximum concept/random images. Default is 500.
     max_test_images : int, optional
         Maximum test images to process. Default is 50.
+    target_class : str, optional
+        Class the attribution is computed for, the same for every test
+        image (e.g. "zebra"), as in the reference implementation. When
+        omitted, attributions are computed for the top-``n_classes``
+        predictions of each image and aggregated by prediction rank.
     cache_dir : str, optional
         Directory for caching. Default is ".cache".
         Set to None to disable caching.
@@ -106,6 +111,7 @@ class GlobalVisualTCAV(VisualTCAV):
         m_steps: int = 50,
         max_examples: int = 500,
         max_test_images: int = 50,
+        target_class: str = None,
         cache_dir: str = ".cache",
         cav_fn=None,
     ):
@@ -124,6 +130,16 @@ class GlobalVisualTCAV(VisualTCAV):
         self.test_image_paths = []
         # stats[layer][concept][rank] = Stat object
         self.stats = {}
+
+        # Fixed target class (reference behaviour) or per-image ranks
+        self.target_class = target_class
+        self.target_class_index = (
+            self.model_wrapper.label_to_id(target_class)
+            if target_class is not None else None
+        )
+        # Number of rows per (layer, concept): one for a fixed target
+        # class, n_classes when aggregating by prediction rank
+        self.n_ranks = 1 if target_class is not None else self.n_classes
 
         if test_images_dir is not None:
             self._load_test_images(test_images_dir)
@@ -244,15 +260,18 @@ class GlobalVisualTCAV(VisualTCAV):
         print(f"  Concepts: {self.concept_names}\n")
 
         # raw_attributions[layer][concept][rank] = list of scores
-        # Rank is used instead of class index because different images may have
-        # slightly different top predictions; rank ensures consistent comparison
+        # With target_class set there is a single rank (0) holding the score
+        # of that class for every image. Otherwise rank r holds, for every
+        # image, the score of its r-th predicted class.
         raw_attributions = {
             layer: {
-                concept: {rank: [] for rank in range(self.n_classes)}
+                concept: {rank: [] for rank in range(self.n_ranks)}
                 for concept in self.concept_names
             }
             for layer in self.layer_names
         }
+        if self.target_class is not None:
+            self.target_classes = [self.target_class_index]
 
         # Phase 1: compute CAVs once — reused across all test images
         print("Phase 1: Computing CAVs...")
@@ -271,16 +290,22 @@ class GlobalVisualTCAV(VisualTCAV):
                 )
                 cavs[layer_name][concept_name] = cav
                 self.computations[layer_name][concept_name].cav = cav
+            # The full random feature maps of this layer are no longer needed
+            self._release_random_feature_maps(layer_name)
 
         # Phase 2: process each test image
         print(f"\nPhase 2: Processing {len(self.test_image_paths)} images...")
         for img_path in tqdm(self.test_image_paths, desc="Images"):
             image_tensor = self._load_image(img_path)
-            predictions = super().predict(image_tensor, img_path)
-            target_classes = [p.class_index for p in predictions.predictions[0]]
-
-            if not self.target_classes:
-                self.target_classes = target_classes
+            if self.target_class is not None:
+                target_classes = [self.target_class_index]
+            else:
+                predictions = super().predict(image_tensor, img_path)
+                target_classes = [
+                    p.class_index for p in predictions.predictions[0]
+                ]
+                if not self.target_classes:
+                    self.target_classes = target_classes
 
             for layer_name in self.layer_names:
                 feature_maps = self.model_wrapper.get_feature_maps(
@@ -306,12 +331,14 @@ class GlobalVisualTCAV(VisualTCAV):
 
         # Phase 3: compute statistics
         print("\nPhase 3: Computing statistics...")
+        if self.target_class is not None:
+            self.target_classes = [self.target_class_index]
         self.stats = {}
         for layer_name in self.layer_names:
             self.stats[layer_name] = {}
             for concept_name in self.concept_names:
                 self.stats[layer_name][concept_name] = {}
-                for rank in range(self.n_classes):
+                for rank in range(self.n_ranks):
                     scores = raw_attributions[layer_name][concept_name][rank]
                     if scores:
                         self.stats[layer_name][concept_name][rank] = Stat(scores)
@@ -347,7 +374,7 @@ class GlobalVisualTCAV(VisualTCAV):
 
         for layer_name in self.layer_names:
             for concept_name in self.concept_names:
-                for rank in range(self.n_classes):
+                for rank in range(self.n_ranks):
                     if rank not in self.stats[layer_name][concept_name]:
                         continue
 
@@ -406,12 +433,12 @@ class GlobalVisualTCAV(VisualTCAV):
         colors = plt.cm.tab10(np.linspace(0, 1, n_concepts))
 
         for ax, layer_name in zip(axes, self.layer_names):
-            x = np.arange(self.n_classes)
+            x = np.arange(self.n_ranks)
             bar_width = 0.8 / n_concepts
 
             for concept_idx, concept_name in enumerate(self.concept_names):
                 means, errors = [], []
-                for rank in range(self.n_classes):
+                for rank in range(self.n_ranks):
                     if rank in self.stats[layer_name][concept_name]:
                         stat = self.stats[layer_name][concept_name][rank]
                         means.append(stat.mean.item())
@@ -432,7 +459,7 @@ class GlobalVisualTCAV(VisualTCAV):
             class_labels = [
                 self.model_wrapper.id_to_label(self.target_classes[r])
                 if r < len(self.target_classes) else f"class_{r}"
-                for r in range(self.n_classes)
+                for r in range(self.n_ranks)
             ]
 
             ax.set_xticks(x)

@@ -323,6 +323,9 @@ class LocalVisualTCAV(VisualTCAV):
                     class_name = self.model_wrapper.id_to_label(class_index)
                     print(f"    {class_name}: {attribution.item():.4f}")
 
+            # The full random feature maps of this layer are no longer needed
+            self._release_random_feature_maps(layer_name)
+
         print("\nExplanation complete. Call plot() to visualize results.")
 
     # -----------------------------------------------------------------------

@@ -300,6 +300,14 @@ def local(model, image, concepts, concept_dir, random_dir, layers,
     help="Number of top predicted classes to explain.",
 )
 @click.option(
+    "--target-class",
+    default=None,
+    type=str,
+    help="Fixed class to compute attributions for on every image "
+         "(e.g. 'zebra'), as in the reference method. If omitted, the "
+         "top --n-classes predictions of each image are used.",
+)
+@click.option(
     "--m-steps",
     default=50,
     show_default=True,
@@ -334,7 +342,8 @@ def local(model, image, concepts, concept_dir, random_dir, layers,
     help="Disable caching. Forces recomputation of all CAVs and activations.",
 )
 def global_cmd(model, images_dir, concepts, concept_dir, random_dir, layers,
-               n_classes, m_steps, max_images, output, cache_dir, no_cache):
+               n_classes, target_class, m_steps, max_images, output, cache_dir,
+               no_cache):
     """
     Explain a class of images using GlobalVisualTCAV.
 
@@ -377,6 +386,7 @@ def global_cmd(model, images_dir, concepts, concept_dir, random_dir, layers,
         random_dir=random_dir,
         layer_names=list(layers),
         n_classes=n_classes,
+        target_class=target_class,
         m_steps=m_steps,
         max_test_images=max_images,
         cache_dir=cache_dir,

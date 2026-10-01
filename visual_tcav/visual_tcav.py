@@ -280,6 +280,14 @@ class VisualTCAV:
         # Main storage: computations[layer_name][concept_name] = ConceptLayer
         self.computations = {}
 
+        # Full (non-pooled) feature maps of the random images, kept in memory
+        # only while the current layer is being processed. They are needed
+        # to compute the concept emblem (see _compute_emblem) and are never
+        # written to disk. Only one layer at a time is held, because early
+        # layers have large maps (hundreds of MB for a few hundred images).
+        self._random_feature_maps = {}
+        self._emblem_chunk_size = 32
+
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Use provided CAV function or fall back to centroid difference default
@@ -460,6 +468,8 @@ class VisualTCAV:
         feature_maps = self.model_wrapper.get_feature_maps_for_concept(
             self.random_dir, layer_name
         )
+        self._random_feature_maps.clear()
+        self._random_feature_maps[layer_name] = feature_maps
 
         # GAP reduces spatial dimensions: [N, C, H, W] -> [N, C]
         pooled = F.adaptive_avg_pool2d(feature_maps, (1, 1))
@@ -469,6 +479,37 @@ class VisualTCAV:
             dump(pooled, cache_path)
 
         return pooled
+
+    def _get_random_feature_maps(self, layer_name: str) -> torch.Tensor:
+        """
+        Return the full [N, C, H, W] feature maps of the random images.
+
+        Uses the maps kept in memory by _compute_random_activations() when
+        available; otherwise (pooled activations were loaded from cache)
+        runs one extra forward pass over the random folder.
+        """
+        if layer_name not in self._random_feature_maps:
+            if self.random_dir is None:
+                raise ValueError(
+                    "random_dir not set. Pass it to the constructor:\n"
+                    "  LocalVisualTCAV(..., random_dir='./path/to/random/', ...)"
+                )
+            self._random_feature_maps.clear()
+            self._random_feature_maps[layer_name] = (
+                self.model_wrapper.get_feature_maps_for_concept(
+                    self.random_dir, layer_name
+                )
+            )
+        return self._random_feature_maps[layer_name]
+
+    def _release_random_feature_maps(self, layer_name: str) -> None:
+        """
+        Free the full random feature maps of a layer once its CAVs are done.
+
+        Called by the explainers at the end of each layer. The pooled
+        activations (and the cache on disk) are not affected.
+        """
+        self._random_feature_maps.pop(layer_name, None)
 
     def _default_cav_fn(
         self,
@@ -492,7 +533,9 @@ class VisualTCAV:
         Returns
         -------
         Cav
-            CAV with direction, centroids, and concept emblem set.
+            CAV with direction and centroids set. The concept emblem is
+            not computed here: it needs the full spatial feature maps and
+            is filled in by _compute_cavs() (see _compute_emblem).
         """
         concept_centroid = torch.mean(concept_features, dim=0)
         random_centroid = torch.mean(random_features, dim=0)
@@ -500,18 +543,61 @@ class VisualTCAV:
         # Direction points from random toward concept in feature space
         direction = concept_centroid - random_centroid
 
-        # Concept emblem: scale factor for concept map normalization
-        concept_emblem = contraharmonic_mean(
-            F.relu(concept_features.unsqueeze(-1).unsqueeze(-1)), axis=(2, 3)
-        )
-        concept_emblem = torch.mean(concept_emblem, dim=0)
-
         return Cav(
             concept_centroid=concept_centroid,
             negative_centroid=random_centroid,
             direction=direction,
-            concept_emblem=concept_emblem,
+            concept_emblem=None,
         )
+
+    def _compute_emblem(
+        self,
+        direction: torch.Tensor,
+        concept_feature_maps: torch.Tensor,
+        random_feature_maps: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute the concept emblem used to normalize concept maps.
+
+        Follows the reference implementation: every concept (and random)
+        image is projected on the CAV direction to obtain its raw concept
+        map, the map is rectified and summarized by its contraharmonic
+        mean over space, and the median over images is taken. The result
+        is the pair (positive emblem, negative emblem): the typical map
+        magnitude when the concept is present and when it is absent.
+
+        Parameters
+        ----------
+        direction : torch.Tensor
+            CAV direction. Shape: [C].
+        concept_feature_maps : torch.Tensor
+            Feature maps of the concept images. Shape: [N, C, H, W].
+        random_feature_maps : torch.Tensor
+            Feature maps of the random images. Shape: [M, C, H, W].
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor of shape [2]: (positive_emblem, negative_emblem).
+        """
+        device = direction.device
+        d = direction.view(1, -1, 1, 1)
+
+        def _emblems(fmaps: torch.Tensor) -> torch.Tensor:
+            # Images are projected in chunks: the projected maps of a few
+            # hundred images at an early layer would otherwise need
+            # several GB at once. Each image is independent, so the
+            # result is the same as projecting all of them together.
+            values = []
+            for start in range(0, fmaps.shape[0], self._emblem_chunk_size):
+                chunk = fmaps[start:start + self._emblem_chunk_size].to(device)
+                projected = F.relu((d * chunk).sum(dim=1))              # [n, H, W]
+                values.append(contraharmonic_mean(projected, axis=(1, 2)))  # [n]
+            return torch.cat(values)
+
+        positive = torch.quantile(_emblems(concept_feature_maps), 0.5)
+        negative = torch.quantile(_emblems(random_feature_maps), 0.5)
+        return torch.stack([positive, negative]).to(torch.float32)
 
     def _compute_cavs(
         self,
@@ -551,9 +637,12 @@ class VisualTCAV:
         )
 
         if cache_path and not force_recompute and os.path.exists(cache_path):
-            print(f"  Loading CAV from cache: {concept_name} @ {layer_name}")
             cav = load(cache_path)
-            return cav.to(self.device)
+            if self._has_valid_emblem(cav):
+                print(f"  Loading CAV from cache: {concept_name} @ {layer_name}")
+                return cav.to(self.device)
+            # Cache written by an older version (scalar emblem): recompute
+            print(f"  Stale CAV cache for {concept_name} @ {layer_name}, recomputing.")
 
         print(f"  Computing CAV: '{concept_name}' @ '{layer_name}'...")
 
@@ -568,10 +657,26 @@ class VisualTCAV:
         # Delegate to cav_fn — default centroid method or user-provided function
         cav = self.cav_fn(pooled_concepts, random_activations)
 
+        # The emblem needs the full spatial maps, so it is computed here
+        # rather than inside cav_fn. A custom cav_fn may still provide its
+        # own (positive, negative) pair, in which case it is kept.
+        if not self._has_valid_emblem(cav):
+            cav.concept_emblem = self._compute_emblem(
+                cav.direction.to(self.device),
+                feature_maps,
+                self._get_random_feature_maps(layer_name),
+            )
+
         if cache_path:
             dump(cav.cpu(), cache_path)
 
         return cav.to(self.device)
+
+    @staticmethod
+    def _has_valid_emblem(cav: Cav) -> bool:
+        """True when the CAV carries a (positive, negative) emblem pair."""
+        emblem = getattr(cav, "concept_emblem", None)
+        return isinstance(emblem, torch.Tensor) and emblem.numel() == 2
 
     # -----------------------------------------------------------------------
     # Integrated Gradients
@@ -598,9 +703,13 @@ class VisualTCAV:
         Returns
         -------
         torch.Tensor
-            Interpolated feature maps. Shape: [m_steps, C, H, W].
+            Interpolated feature maps. Shape: [m_steps + 1, C, H, W]
+            (alpha = 0, 1/m, ..., 1, so that the trapezoidal rule can be
+            applied over m_steps intervals, as in the reference).
         """
-        alphas = torch.linspace(0, 1, self.m_steps, device=feature_maps.device).view(self.m_steps, 1, 1, 1)
+        alphas = torch.linspace(
+            0, 1, self.m_steps + 1, device=feature_maps.device
+        ).view(self.m_steps + 1, 1, 1, 1)
         delta = feature_maps - baseline
         return baseline + alphas * delta
 
@@ -630,11 +739,16 @@ class VisualTCAV:
         baseline = torch.zeros_like(feature_maps)
         interpolated = self._interpolate_feature_maps(feature_maps, baseline)
 
+        # get_gradient_of_score() returns on CPU (it accumulates batches on the
+        # compute device and transfers once). Bring the result back onto the
+        # device the feature maps live on before combining the two, otherwise
+        # this line raises a device mismatch on GPU.
         gradients = self.model_wrapper.get_gradient_of_score(
             interpolated, layer_name, class_index
-        )
+        ).to(feature_maps.device)
 
-        avg_gradients = torch.mean(gradients, dim=0)
+        # Trapezoidal rule over the m_steps intervals (reference behaviour)
+        avg_gradients = ((gradients[:-1] + gradients[1:]) / 2.0).mean(dim=0)
 
         # Scale by the actual input change from baseline to feature maps
         return (feature_maps.squeeze(0) - baseline.squeeze(0)) * avg_gradients
@@ -684,9 +798,10 @@ class VisualTCAV:
         Without normalization, concept maps from different concepts or images
         are not comparable due to differing absolute activation scales.
 
-        If no concept emblem is available (e.g. when using a custom cav_fn
-        that does not compute it), falls back to normalizing by the map's
-        own maximum value.
+        With the default emblem, a pair (positive, negative) computed as in
+        the reference implementation, the map is clipped to
+        [negative, positive] and rescaled linearly to [0, 1]. If a custom
+        cav_fn provides no emblem, the map is divided by its own maximum.
 
         Parameters
         ----------
@@ -700,13 +815,18 @@ class VisualTCAV:
         torch.Tensor
             Normalized concept map with values in [0, 1].
         """
-        if cav.concept_emblem is not None:
-            concept_emblem = cav.concept_emblem.to(self.device)
-            scale = torch.mean(concept_emblem) + 1e-10
-        else:
-            # Fallback when custom cav_fn does not provide a concept emblem
-            scale = raw_map.max() + 1e-10
+        if self._has_valid_emblem(cav):
+            positive, negative = cav.concept_emblem.to(self.device)
+            if positive > negative:
+                # Values below the negative emblem are background noise
+                # (-> 0); values above the positive emblem are saturated (-> 1)
+                clipped = torch.clamp(raw_map, min=negative, max=positive)
+                return (clipped - negative) / (positive - negative)
+            # The concept is not better recognized than random noise
+            return torch.zeros_like(raw_map)
 
+        # Fallback when a custom cav_fn provides no emblem
+        scale = raw_map.max() + 1e-10
         return torch.clamp(raw_map / scale, 0.0, 1.0)
 
     # -----------------------------------------------------------------------
@@ -725,8 +845,10 @@ class VisualTCAV:
         Compute the attribution score for a concept at a layer for a class.
 
         Combines IG with the concept map: IG identifies which feature map
-        values matter for the class, the concept map masks to regions where
-        the concept is present, and dot product with CAV yields a scalar.
+        values matter for the class, the concept map masks to the regions
+        where the concept is present, and the dot product with the rectified
+        CAV direction yields a scalar. Both operands of that dot product are
+        non-negative, so the returned score is non-negative as well.
 
         Parameters
         ----------
@@ -746,17 +868,62 @@ class VisualTCAV:
         torch.Tensor
             Scalar attribution score.
         """
+        fmaps = feature_maps.squeeze(0)                       # [C, H, W]
+
+        # --- Integrated Gradients for this class ---------------------------
         ig = self._compute_integrated_gradients(
             feature_maps, layer_name, class_index
         )
 
-        # Mask IG with concept map: keep only regions where concept is present
-        masked_ig = F.relu(ig * concept_map.unsqueeze(0))
+        # --- Expected IG magnitude for this class --------------------------
+        # The logit gap between the real feature maps and the zero baseline
+        # sets the scale the attribution is normalized to, so that scores are
+        # comparable across classes and images.
+        with torch.no_grad():
+            logits = self.model_wrapper.get_logits(feature_maps, layer_name)[0]
+            logits_baseline = self.model_wrapper.get_logits(
+                torch.zeros_like(feature_maps), layer_name
+            )[0]
 
-        direction = cav.direction.to(self.device)
-        direction_norm = (direction / (torch.norm(direction) + 1e-10)).view(-1, 1, 1)
+        ig_expected = F.relu(logits - logits_baseline)
+        ig_expected_max = ig_expected.max()
+        if ig_expected_max > 0:
+            ig_expected = ig_expected / ig_expected_max
+        ig_expected_class = ig_expected[class_index].to(fmaps.device)
 
-        return (masked_ig * direction_norm).sum()
+        # --- Non-negative attribution tensor, rescaled ---------------------
+        # ig already equals (feature_maps - baseline) * average gradient,
+        # i.e. the reference's relu(gradient * feature_maps) once rectified.
+        attributions = F.relu(ig)
+        attributions = attributions * (
+            ig_expected_class / (attributions.sum() + 1e-10)
+        )
+
+        # --- Mask with the concept map, then pool over space ---------------
+        masked = attributions * concept_map.unsqueeze(0)
+        pooled_masked = masked.sum(dim=(1, 2))                # [C], >= 0
+
+        # --- Rectified, max-normalized CAV direction -----------------------
+        # Rectifying the direction is what keeps the final score non-negative:
+        # the dot product below is between two non-negative vectors. Layers
+        # that can emit negative feature maps get a per-channel sign
+        # correction first.
+        direction = cav.direction.to(fmaps.device)
+        if fmaps.min() < 0:
+            sign = torch.where(
+                (fmaps * concept_map.unsqueeze(0)).sum(dim=(1, 2)) < 0,
+                -1.0,
+                1.0,
+            )
+            pooled_cav_norm = F.relu(direction * sign)
+        else:
+            pooled_cav_norm = F.relu(direction)
+
+        max_cav = pooled_cav_norm.max()
+        if max_cav > 0:
+            pooled_cav_norm = pooled_cav_norm / max_cav       # [C], in [0, 1]
+
+        return torch.dot(pooled_cav_norm, pooled_masked)
 
     # -----------------------------------------------------------------------
     # Prediction
